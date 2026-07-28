@@ -1,0 +1,23 @@
+{
+  "name": "codex-windows-toast",
+  "version": "1.0.0",
+  "description": "Show a Windows toast when a Codex CLI turn ends.",
+  "author": {
+    "name": "wxh"
+  },
+  "keywords": [
+    "codex",
+    "windows",
+    "toast",
+    "notifications"
+  ],
+  "interface": {
+    "displayName": "Codex Windows Toast",
+    "shortDescription": "Show the current prompt and finished Codex reply.",
+    "longDescription": "Sends a native Windows toast after the main Codex CLI agent finishes a turn, using the current user prompt as the title and the final assistant message as the body.",
+    "developerName": "wxh",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Check whether Codex Windows Toast is installed correctly."
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "codex-windows-toast",
+  "interface": {
+    "displayName": "Codex Windows Toast"
+  },
+  "plugins": [
+    {
+      "name": "codex-windows-toast",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-windows-toast"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
