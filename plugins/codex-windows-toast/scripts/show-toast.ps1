@@ -4,6 +4,27 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "activation-common.ps1")
+
+if (-not ("CodexWindowsToast.WindowCapture" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace CodexWindowsToast {
+    public static class WindowCapture {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    }
+}
+"@
+}
 
 try {
     [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -60,6 +81,36 @@ function Get-SessionStatePath {
     return Join-Path (Get-PluginDataPath) "turn-$safeSessionId.json"
 }
 
+function Get-ForegroundWindowTarget {
+    try {
+        $window = [CodexWindowsToast.WindowCapture]::GetForegroundWindow()
+        if ($window -eq [IntPtr]::Zero) {
+            return $null
+        }
+
+        $rootWindow = [CodexWindowsToast.WindowCapture]::GetAncestor($window, 2)
+        if ($rootWindow -ne [IntPtr]::Zero) {
+            $window = $rootWindow
+        }
+
+        [uint32]$processId = 0
+        [void][CodexWindowsToast.WindowCapture]::GetWindowThreadProcessId($window, [ref]$processId)
+        if ($processId -eq 0) {
+            return $null
+        }
+
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        return [pscustomobject]@{
+            hwnd = $window.ToInt64()
+            pid = [long]$processId
+            started_utc_ticks = $process.StartTime.ToUniversalTime().Ticks
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
 function Write-HookStatus {
     param(
         [string]$EventName,
@@ -90,7 +141,9 @@ function Write-HookStatus {
 function Send-CodexToast {
     param(
         [string]$Title,
-        [string]$Message
+        [string]$Message,
+        [AllowEmptyString()]
+        [string]$ActivationUri = ""
     )
 
     $appId = Get-ToastAppId
@@ -104,8 +157,22 @@ function Send-CodexToast {
 
     $escapedTitle = [System.Security.SecurityElement]::Escape($Title)
     $escapedMessage = [System.Security.SecurityElement]::Escape($Message)
+    $actionsXml = ""
+    $toastAttributes = 'duration="long"'
+    if (-not [string]::IsNullOrWhiteSpace($ActivationUri)) {
+        $escapedActivationUri = [System.Security.SecurityElement]::Escape($ActivationUri)
+        $ignoredUri = [System.Security.SecurityElement]::Escape("${script:CodexToastProtocol}://ignore")
+        $toastAttributes += " launch=`"$ignoredUri`" activationType=`"protocol`""
+        $actionsXml = @"
+    <actions>
+      <action content="&#x8DF3;&#x8F6C;" arguments="$escapedActivationUri" activationType="protocol" />
+      <action content="&#x5FFD;&#x7565;" arguments="dismiss" activationType="system" />
+    </actions>
+"@
+    }
+
     $toastXml = @"
-<toast duration="short">
+<toast $toastAttributes>
   <visual>
     <binding template="ToastGeneric">
       <text>$escapedTitle</text>
@@ -113,6 +180,7 @@ function Send-CodexToast {
       <text placement="attribution">Codex CLI</text>
     </binding>
   </visual>
+$actionsXml
   <audio src="ms-winsoundevent:Notification.Default" />
 </toast>
 "@
@@ -125,7 +193,19 @@ function Send-CodexToast {
 
 try {
     if ($Test) {
-        Send-CodexToast -Title "Codex is ready" -Message "Windows toast notifications are working."
+        $activationUri = ""
+        $target = Get-ForegroundWindowTarget
+        $activationContext = Get-CodexToastActivationContext
+        if ($null -ne $target -and $activationContext.Installed) {
+            try {
+                $activationUri = New-CodexToastActivationUri -Target $target -Context $activationContext
+            }
+            catch {
+                $activationUri = ""
+            }
+        }
+
+        Send-CodexToast -Title "Codex is ready" -Message "Windows toast notifications are working." -ActivationUri $activationUri
     }
     else {
         $rawInput = [Console]::In.ReadToEnd()
@@ -137,10 +217,18 @@ try {
         if ($eventName -eq "UserPromptSubmit") {
             $pluginData = Get-PluginDataPath
             New-Item -ItemType Directory -Path $pluginData -Force | Out-Null
-            [ordered]@{
+            $target = Get-ForegroundWindowTarget
+            $turnState = [ordered]@{
                 turn_id = $turnId
                 title = ConvertTo-ToastText -Text ([string]$hookInput.prompt) -MaxLength 120
-            } | ConvertTo-Json | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
+            }
+            if ($null -ne $target) {
+                $turnState.hwnd = $target.hwnd
+                $turnState.pid = $target.pid
+                $turnState.started_utc_ticks = $target.started_utc_ticks
+            }
+
+            $turnState | ConvertTo-Json | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
             Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "prompt-saved"
             [Console]::Out.WriteLine('{"continue":true}')
             exit 0
@@ -152,11 +240,30 @@ try {
         }
 
         $title = "Codex is ready"
+        $activationUri = ""
         $statePath = Get-SessionStatePath -SessionId $sessionId
         if (Test-Path -LiteralPath $statePath) {
             $turnState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
             if ([string]$turnState.turn_id -eq $turnId -and -not [string]::IsNullOrWhiteSpace([string]$turnState.title)) {
                 $title = [string]$turnState.title
+
+                $activationContext = Get-CodexToastActivationContext
+                if ($activationContext.Installed -and
+                    [long]$turnState.hwnd -gt 0 -and
+                    [long]$turnState.pid -gt 0 -and
+                    [long]$turnState.started_utc_ticks -gt 0) {
+                    $target = [pscustomobject]@{
+                        hwnd = [long]$turnState.hwnd
+                        pid = [long]$turnState.pid
+                        started_utc_ticks = [long]$turnState.started_utc_ticks
+                    }
+                    try {
+                        $activationUri = New-CodexToastActivationUri -Target $target -Context $activationContext
+                    }
+                    catch {
+                        $activationUri = ""
+                    }
+                }
             }
         }
 
@@ -165,8 +272,11 @@ try {
             $message = "The current turn has finished."
         }
 
-        Send-CodexToast -Title $title -Message $message
+        Send-CodexToast -Title $title -Message $message -ActivationUri $activationUri
         Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "toast-sent"
+        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            Remove-Item -LiteralPath $statePath -Force
+        }
     }
 }
 catch {
