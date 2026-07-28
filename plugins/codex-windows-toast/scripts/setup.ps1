@@ -15,11 +15,13 @@ $ErrorActionPreference = "Stop"
 
 $runtimePath = Get-CodexToastRuntimePath
 $handlerPath = Get-CodexToastHandlerPath
+$launcherPath = Get-CodexToastLauncherPath
 $commonPath = Join-Path $runtimePath "activation-common.ps1"
 $secretPath = Join-Path $runtimePath "secret.dat"
 $recordPath = Join-Path $runtimePath "install.json"
 $protocolKey = "Software\Classes\$script:CodexToastProtocol"
 $sourceHandler = Join-Path $PSScriptRoot "activate-window.ps1"
+$sourceLauncher = Join-Path $PSScriptRoot "launch-hidden.vbs"
 $sourceCommon = Join-Path $PSScriptRoot "activation-common.ps1"
 $pluginManifest = Join-Path (Split-Path $PSScriptRoot -Parent) ".codex-plugin\plugin.json"
 
@@ -72,6 +74,7 @@ function Test-OwnedRuntimeDirectory {
 
     $ownedNames = @(
         "activate-window.ps1",
+        "launch-hidden.vbs",
         "activation-common.ps1",
         "secret.dat",
         "install.json",
@@ -101,7 +104,11 @@ function Test-OwnedRegistryLayout {
 
     try {
         $command = Get-CodexToastRegisteredCommand
-        if ($command -cne (Get-CodexToastRegistryCommand -HandlerPath $handlerPath)) {
+        $ownedCommands = @(
+            Get-CodexToastRegistryCommand -LauncherPath $launcherPath
+            Get-CodexToastLegacyRegistryCommand -HandlerPath $handlerPath
+        )
+        if ($command -cnotin $ownedCommands) {
             throw "The existing $script:CodexToastProtocol protocol is not owned by this installation."
         }
 
@@ -150,7 +157,7 @@ function Test-OwnedRegistryLayout {
 }
 
 function Install-ActivationComponent {
-    foreach ($sourcePath in @($sourceHandler, $sourceCommon, $pluginManifest)) {
+    foreach ($sourcePath in @($sourceHandler, $sourceLauncher, $sourceCommon, $pluginManifest)) {
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
             throw "Required source file is missing: $sourcePath"
         }
@@ -167,6 +174,7 @@ function Install-ActivationComponent {
     if ($PSCmdlet.ShouldProcess($runtimePath, "Install window activation files")) {
         New-Item -ItemType Directory -Path $runtimePath -Force | Out-Null
         Copy-Item -LiteralPath $sourceHandler -Destination $handlerPath -Force
+        Copy-Item -LiteralPath $sourceLauncher -Destination $launcherPath -Force
         Copy-Item -LiteralPath $sourceCommon -Destination $commonPath -Force
 
         if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
@@ -189,7 +197,7 @@ function Install-ActivationComponent {
         }
     }
 
-    $command = Get-CodexToastRegistryCommand -HandlerPath $handlerPath
+    $command = Get-CodexToastRegistryCommand -LauncherPath $launcherPath
     if ($PSCmdlet.ShouldProcess("HKCU\$protocolKey", "Register the $script:CodexToastProtocol URI protocol")) {
         $root = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($protocolKey)
         try {
@@ -217,6 +225,7 @@ function Install-ActivationComponent {
             protocol = $script:CodexToastProtocol
             plugin_version = [string]$manifest.version
             handler_path = $handlerPath
+            launcher_path = $launcherPath
             command = $command
             installed_at = [DateTimeOffset]::Now.ToString("o")
         } | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding UTF8
@@ -278,6 +287,7 @@ function Uninstall-ActivationComponent {
 
     $ownedFiles = @(
         "activate-window.ps1",
+        "launch-hidden.vbs",
         "activation-common.ps1",
         "secret.dat",
         "install.json",

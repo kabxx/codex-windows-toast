@@ -9,7 +9,18 @@ function Get-CodexToastHandlerPath {
     return Join-Path (Get-CodexToastRuntimePath) "activate-window.ps1"
 }
 
+function Get-CodexToastLauncherPath {
+    return Join-Path (Get-CodexToastRuntimePath) "launch-hidden.vbs"
+}
+
 function Get-CodexToastRegistryCommand {
+    param([string]$LauncherPath = (Get-CodexToastLauncherPath))
+
+    $wscriptPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) "wscript.exe"
+    return "`"$wscriptPath`" //B //NoLogo `"$LauncherPath`" `"%1`""
+}
+
+function Get-CodexToastLegacyRegistryCommand {
     param([string]$HandlerPath = (Get-CodexToastHandlerPath))
 
     return "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$HandlerPath`" `"%1`""
@@ -35,6 +46,7 @@ function Get-CodexToastActivationContext {
     $runtimePath = Get-CodexToastRuntimePath
     $recordPath = Join-Path $runtimePath "install.json"
     $handlerPath = Get-CodexToastHandlerPath
+    $launcherPath = Get-CodexToastLauncherPath
     $commonPath = Join-Path $runtimePath "activation-common.ps1"
     $secretPath = Join-Path $runtimePath "secret.dat"
 
@@ -44,15 +56,20 @@ function Get-CodexToastActivationContext {
         }
 
         $record = Get-Content -Raw -LiteralPath $recordPath | ConvertFrom-Json
-        $expectedCommand = Get-CodexToastRegistryCommand -HandlerPath $handlerPath
+        if ([string]::IsNullOrWhiteSpace([string]$record.launcher_path)) {
+            throw "The activation component needs to be reinstalled."
+        }
+
+        $expectedCommand = Get-CodexToastRegistryCommand -LauncherPath $launcherPath
         if ([string]$record.owner -cne $script:CodexToastOwner -or
             [string]$record.protocol -cne $script:CodexToastProtocol -or
             [IO.Path]::GetFullPath([string]$record.handler_path) -cne [IO.Path]::GetFullPath($handlerPath) -or
+            [IO.Path]::GetFullPath([string]$record.launcher_path) -cne [IO.Path]::GetFullPath($launcherPath) -or
             [string]$record.command -cne $expectedCommand) {
             throw "The activation install record is not owned by this plugin."
         }
 
-        foreach ($path in @($handlerPath, $commonPath, $secretPath)) {
+        foreach ($path in @($handlerPath, $launcherPath, $commonPath, $secretPath)) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
                 throw "Activation component file is missing: $path"
             }
@@ -66,6 +83,7 @@ function Get-CodexToastActivationContext {
             Installed = $true
             RuntimePath = $runtimePath
             HandlerPath = $handlerPath
+            LauncherPath = $launcherPath
             SecretPath = $secretPath
             Record = $record
             Error = ""
@@ -76,6 +94,7 @@ function Get-CodexToastActivationContext {
             Installed = $false
             RuntimePath = $runtimePath
             HandlerPath = $handlerPath
+            LauncherPath = $launcherPath
             SecretPath = $secretPath
             Record = $null
             Error = $_.Exception.Message

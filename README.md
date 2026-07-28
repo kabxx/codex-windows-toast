@@ -58,9 +58,11 @@ Installation creates only these user-scoped artifacts:
 - `%LOCALAPPDATA%\CodexWindowsToast`
 
 It does not install a service, scheduled task, startup item, or background
-process. The URI contains only a signed window handle, process ID, and process
-start time; it never contains prompt or response text. If the activation
-component is absent or invalid, notifications continue without action buttons.
+process. The protocol starts through Windows' built-in `wscript.exe`, which
+launches the PowerShell activation handler without opening a console window.
+The URI contains only a signed window handle, process ID, and process start
+time; it never contains prompt or response text. If the activation component
+is absent or invalid, notifications continue without action buttons.
 
 The button targets the captured top-level window, such as Windows Terminal or
 VS Code; it does not select a terminal tab or editor terminal. Activation on the
