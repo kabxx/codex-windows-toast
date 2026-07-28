@@ -3,9 +3,11 @@
 [English](README.md) | [简体中文](docs/README.zh-CN.md)
 
 `codex-windows-toast` is a Windows-only Codex CLI plugin. It sends one native
-Windows toast whenever the main agent finishes a turn and returns control to
-the user. The toast title is the current user prompt, and its body is the final
-assistant message for that turn. Notifications use Windows' `long` duration
+Windows toast whenever the main agent finishes a user-submitted turn and
+returns control to the user. The toast title is the current user prompt, and
+its body is the final assistant message for that turn. Stops without a matching
+user submission, such as automatic background continuations, are ignored.
+Notifications use Windows' `long` duration
 and can include two actions. Their labels follow the current Windows display
 language, with concise English labels as the fallback:
 

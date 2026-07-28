@@ -307,7 +307,7 @@ try {
             exit 0
         }
 
-        $title = "Codex is ready"
+        $title = ""
         $activationUri = ""
         $statePath = Get-SessionStatePath -SessionId $sessionId
         if (Test-Path -LiteralPath $statePath) {
@@ -333,6 +333,15 @@ try {
                     }
                 }
             }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($title)) {
+            if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+                Remove-Item -LiteralPath $statePath -Force
+            }
+            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "skipped-no-prompt"
+            [Console]::Out.WriteLine('{"continue":true}')
+            exit 0
         }
 
         $message = ConvertTo-ToastText -Text ([string]$hookInput.last_assistant_message) -MaxLength 240

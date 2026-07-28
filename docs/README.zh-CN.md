@@ -3,8 +3,9 @@
 [English](../README.md) | [简体中文](README.zh-CN.md)
 
 `codex-windows-toast` 是一个仅适用于 Windows 的 Codex CLI 插件。主 Agent
-完成一轮并等待用户回复时，它会发送一条 Windows 原生 Toast 通知。通知标题
-是本轮用户消息，正文是本轮最后一条助手回复。通知使用 Windows 的 `long`
+完成由用户提交的一轮并等待用户回复时，它会发送一条 Windows 原生 Toast 通知。
+通知标题是本轮用户消息，正文是本轮最后一条助手回复。没有匹配用户提交的 Stop
+（例如自动后台续跑）会被忽略。通知使用 Windows 的 `long`
 显示时长，并可包含两个操作按钮。按钮会跟随当前 Windows 显示语言，未支持
 的语言回退为简短英文：
 
