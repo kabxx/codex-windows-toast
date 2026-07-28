@@ -19,6 +19,12 @@ It does not notify for mid-turn approval requests. Disabling the plugin disables
 the notification hooks. The plugin uses Windows' built-in toast APIs and does
 not require an additional PowerShell module.
 
+Commands registered for the same `Stop` event run concurrently. If another
+`Stop` hook blocks completion and makes Codex continue, this plugin can notify
+before that continuation. Codex does not currently expose a plugin hook after
+all `Stop` decisions are aggregated, so avoid combining it with a `Stop` hook
+that continues the turn when exact notification timing is required.
+
 ## Requirements
 
 - Windows 10 or Windows 11
@@ -53,7 +59,12 @@ opt-in because Windows requires a per-user URI protocol handler for a toast
 button to launch code. Review the script, preview its changes, then install it:
 
 ```powershell
-$setup = ".\plugins\codex-windows-toast\scripts\setup.ps1"
+$pluginId = "codex-windows-toast@codex-windows-toast"
+$plugin = (codex plugin list --json | ConvertFrom-Json).installed |
+    Where-Object pluginId -EQ $pluginId | Select-Object -First 1
+if ($null -eq $plugin) { throw "$pluginId is not installed." }
+$setup = Join-Path $plugin.source.path "scripts\setup.ps1"
+if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "setup.ps1 was not found at $setup" }
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Install -WhatIf
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Install
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Status
@@ -71,23 +82,44 @@ The URI contains only a signed window handle, process ID, and process start
 time; it never contains prompt or response text. If the activation component
 is absent or invalid, notifications continue without action buttons.
 
+`-Status` reports both `Installed` and `Current`. After a plugin update, rerun
+`-Install` when `Current` is `False`; the notification hook continues without
+action buttons until the runtime component matches the installed plugin.
+
 The button targets the captured top-level window, such as Windows Terminal or
 VS Code; it does not select a terminal tab or editor terminal. Activation on the
 current virtual desktop is supported. Windows may reject or decline to switch
 to a window on another virtual desktop, so cross-desktop activation is best
 effort.
 
-To remove every artifact created by the activation setup, run:
+## Uninstall
+
+Remove the activation component before removing the plugin so the setup script
+is still available. This order removes the URI protocol, LocalAppData runtime,
+plugin state, and finally the Codex plugin:
 
 ```powershell
+$pluginId = "codex-windows-toast@codex-windows-toast"
+$plugin = (codex plugin list --json | ConvertFrom-Json).installed |
+    Where-Object pluginId -EQ $pluginId | Select-Object -First 1
+if ($null -eq $plugin) { throw "$pluginId is not installed." }
+$setup = Join-Path $plugin.source.path "scripts\setup.ps1"
+if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "setup.ps1 was not found at $setup" }
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Uninstall -WhatIf
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Uninstall
+codex plugin remove $pluginId
 ```
 
 Uninstall verifies the install record and registry command before removing
 anything. It deletes only the known registry keys, runtime files, and plugin
 state files it owns. Unknown content in the registry or runtime directory is
 left untouched and reported as an error.
+
+If no other installed plugin uses this marketplace, it can then be removed:
+
+```powershell
+codex plugin marketplace remove codex-windows-toast
+```
 
 ## Enable Or Disable
 
@@ -97,7 +129,13 @@ Space. Start a new session after changing plugin state.
 ## Test The Windows Toast
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\plugins\codex-windows-toast\scripts\show-toast.ps1" -Test
+$pluginId = "codex-windows-toast@codex-windows-toast"
+$plugin = (codex plugin list --json | ConvertFrom-Json).installed |
+    Where-Object pluginId -EQ $pluginId | Select-Object -First 1
+if ($null -eq $plugin) { throw "$pluginId is not installed." }
+$testScript = Join-Path $plugin.source.path "scripts\show-toast.ps1"
+if (-not (Test-Path -LiteralPath $testScript -PathType Leaf)) { throw "show-toast.ps1 was not found at $testScript" }
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $testScript -Test
 ```
 
 The script uses Windows' built-in toast APIs and does not require a PowerShell

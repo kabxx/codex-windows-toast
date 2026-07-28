@@ -15,6 +15,11 @@
 插件不会为执行过程中的审批请求发送通知。禁用插件会同时禁用通知 Hook。
 插件使用 Windows 内置的 Toast API，无需安装额外的 PowerShell 模块。
 
+同一个 `Stop` 事件中的命令会并发运行。如果另一个 `Stop` Hook 阻止结束并让
+Codex 继续工作，本插件可能会在续跑前提前通知。目前 Codex 没有提供在所有
+`Stop` 决策汇总后触发的插件 Hook；如果要求通知时机完全准确，请不要与会让
+当前回合继续的 `Stop` Hook 同时使用。
+
 ## 系统要求
 
 - Windows 10 或 Windows 11
@@ -47,7 +52,12 @@ Windows 要求 Toast 按钮通过当前用户级 URI 协议处理器启动代码
 脚本、预览变更，再执行安装：
 
 ```powershell
-$setup = ".\plugins\codex-windows-toast\scripts\setup.ps1"
+$pluginId = "codex-windows-toast@codex-windows-toast"
+$plugin = (codex plugin list --json | ConvertFrom-Json).installed |
+    Where-Object pluginId -EQ $pluginId | Select-Object -First 1
+if ($null -eq $plugin) { throw "$pluginId is not installed." }
+$setup = Join-Path $plugin.source.path "scripts\setup.ps1"
+if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "setup.ps1 was not found at $setup" }
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Install -WhatIf
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Install
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Status
@@ -64,20 +74,40 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Status
 消息或助手回复。如果激活组件缺失或无效，普通通知仍会继续显示，但不包含
 操作按钮。
 
+`-Status` 会同时显示 `Installed` 和 `Current`。插件升级后，如果 `Current`
+为 `False`，请重新运行 `-Install`。在运行时组件与已安装插件一致之前，普通
+通知仍会显示，但不包含操作按钮。
+
 返回按钮面向捕获到的顶层窗口，例如 Windows Terminal 或 VS Code；它不会
 选择具体的终端标签页或编辑器终端。同一虚拟桌面内支持窗口激活。Windows
 可能拒绝激活另一个虚拟桌面上的窗口，因此跨桌面激活仅为尽力尝试。
 
-如需删除激活组件创建的全部内容，请运行：
+## 完整卸载
+
+请先卸载激活组件，再移除 Codex 插件，确保 setup 脚本仍然可用。以下顺序会
+依次清理 URI 协议、LocalAppData 运行时、插件状态，最后移除 Codex 插件：
 
 ```powershell
+$pluginId = "codex-windows-toast@codex-windows-toast"
+$plugin = (codex plugin list --json | ConvertFrom-Json).installed |
+    Where-Object pluginId -EQ $pluginId | Select-Object -First 1
+if ($null -eq $plugin) { throw "$pluginId is not installed." }
+$setup = Join-Path $plugin.source.path "scripts\setup.ps1"
+if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "setup.ps1 was not found at $setup" }
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Uninstall -WhatIf
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Uninstall
+codex plugin remove $pluginId
 ```
 
 卸载程序会先验证安装记录和注册表命令，再执行删除。它只删除自身拥有的已知
 注册表项、运行时文件和插件状态文件。如果注册表或运行时目录中存在未知内容，
 卸载程序会保留这些内容并报告错误。
+
+如果没有其他已安装插件使用这个 marketplace，还可以继续移除它：
+
+```powershell
+codex plugin marketplace remove codex-windows-toast
+```
 
 ## 启用或禁用
 
@@ -87,7 +117,13 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $setup -Uninstal
 ## 测试 Windows Toast
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\plugins\codex-windows-toast\scripts\show-toast.ps1" -Test
+$pluginId = "codex-windows-toast@codex-windows-toast"
+$plugin = (codex plugin list --json | ConvertFrom-Json).installed |
+    Where-Object pluginId -EQ $pluginId | Select-Object -First 1
+if ($null -eq $plugin) { throw "$pluginId is not installed." }
+$testScript = Join-Path $plugin.source.path "scripts\show-toast.ps1"
+if (-not (Test-Path -LiteralPath $testScript -PathType Leaf)) { throw "show-toast.ps1 was not found at $testScript" }
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $testScript -Test
 ```
 
 脚本使用 Windows 内置的 Toast API，不需要额外的 PowerShell 模块。启用返回

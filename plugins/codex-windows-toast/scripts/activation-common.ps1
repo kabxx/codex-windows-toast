@@ -1,5 +1,13 @@
 $script:CodexToastProtocol = "codex-windows-toast"
 $script:CodexToastOwner = "codex-windows-toast"
+$script:CodexToastActivationRecordSchemaVersion = 2
+$script:CodexToastActivationComponentVersion = 1
+$script:CodexToastActivationSourcePath = $PSScriptRoot
+$script:CodexToastActivationFileNames = @(
+    "activate-window.ps1",
+    "launch-hidden.vbs",
+    "activation-common.ps1"
+)
 
 function Get-CodexToastRuntimePath {
     return Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "CodexWindowsToast"
@@ -11,6 +19,77 @@ function Get-CodexToastHandlerPath {
 
 function Get-CodexToastLauncherPath {
     return Join-Path (Get-CodexToastRuntimePath) "launch-hidden.vbs"
+}
+
+function Get-CodexToastActivationComponent {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BasePath
+    )
+
+    $fileHashes = [ordered]@{}
+    foreach ($name in $script:CodexToastActivationFileNames) {
+        $path = Join-Path $BasePath $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Activation component file is missing: $path"
+        }
+
+        $stream = [IO.File]::Open(
+            $path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        $fileHasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $fileHashes[$name] = ([BitConverter]::ToString($fileHasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $fileHasher.Dispose()
+            $stream.Dispose()
+        }
+    }
+
+    $fingerprintLines = @("component_version=$script:CodexToastActivationComponentVersion")
+    foreach ($name in $script:CodexToastActivationFileNames) {
+        $fingerprintLines += "$name=$($fileHashes[$name])"
+    }
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $fingerprintBytes = [Text.Encoding]::UTF8.GetBytes(($fingerprintLines -join "`n"))
+        $fingerprint = ([BitConverter]::ToString($sha256.ComputeHash($fingerprintBytes))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    return [pscustomobject]@{
+        Version = $script:CodexToastActivationComponentVersion
+        Fingerprint = $fingerprint
+        FileHashes = $fileHashes
+    }
+}
+
+function Test-CodexToastActivationComponentRecord {
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)]$Component
+    )
+
+    if ([int]$Record.schema_version -ne $script:CodexToastActivationRecordSchemaVersion -or
+        [int]$Record.activation_component_version -ne $Component.Version -or
+        [string]$Record.activation_component_fingerprint -cne $Component.Fingerprint -or
+        $null -eq $Record.file_hashes) {
+        throw "The activation component is out of date. Run setup.ps1 -Install again."
+    }
+
+    foreach ($name in $script:CodexToastActivationFileNames) {
+        $property = $Record.file_hashes.PSObject.Properties[$name]
+        if ($null -eq $property -or [string]$property.Value -cne [string]$Component.FileHashes[$name]) {
+            throw "The activation component is out of date. Run setup.ps1 -Install again."
+        }
+    }
 }
 
 function Get-CodexToastRegistryCommand {
@@ -79,19 +158,43 @@ function Get-CodexToastActivationContext {
             throw "The registered protocol command does not match this installation."
         }
 
-        return [pscustomobject]@{
-            Installed = $true
-            RuntimePath = $runtimePath
-            HandlerPath = $handlerPath
-            LauncherPath = $launcherPath
-            SecretPath = $secretPath
-            Record = $record
-            Error = ""
+        try {
+            $sourceComponent = Get-CodexToastActivationComponent -BasePath $script:CodexToastActivationSourcePath
+            $runtimeComponent = Get-CodexToastActivationComponent -BasePath $runtimePath
+            Test-CodexToastActivationComponentRecord -Record $record -Component $sourceComponent
+            Test-CodexToastActivationComponentRecord -Record $record -Component $runtimeComponent
+            if ($sourceComponent.Fingerprint -cne $runtimeComponent.Fingerprint) {
+                throw "The activation component is out of date. Run setup.ps1 -Install again."
+            }
+
+            return [pscustomobject]@{
+                Installed = $true
+                Current = $true
+                RuntimePath = $runtimePath
+                HandlerPath = $handlerPath
+                LauncherPath = $launcherPath
+                SecretPath = $secretPath
+                Record = $record
+                Error = ""
+            }
+        }
+        catch {
+            return [pscustomobject]@{
+                Installed = $true
+                Current = $false
+                RuntimePath = $runtimePath
+                HandlerPath = $handlerPath
+                LauncherPath = $launcherPath
+                SecretPath = $secretPath
+                Record = $record
+                Error = $_.Exception.Message
+            }
         }
     }
     catch {
         return [pscustomobject]@{
             Installed = $false
+            Current = $false
             RuntimePath = $runtimePath
             HandlerPath = $handlerPath
             LauncherPath = $launcherPath

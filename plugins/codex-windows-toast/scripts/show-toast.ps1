@@ -44,12 +44,41 @@ function ConvertTo-ToastText {
         [int]$MaxLength
     )
 
-    $singleLine = [regex]::Replace($Text, "\s+", " ").Trim()
-    if ($singleLine.Length -le $MaxLength) {
+    if ($MaxLength -lt 4) {
+        throw "MaxLength must be at least 4."
+    }
+
+    $xmlText = New-Object Text.StringBuilder
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $unit = $Text[$index]
+        if ([char]::IsHighSurrogate($unit)) {
+            if ($index + 1 -lt $Text.Length -and [char]::IsLowSurrogate($Text[$index + 1])) {
+                [void]$xmlText.Append($unit)
+                [void]$xmlText.Append($Text[$index + 1])
+                $index++
+            }
+            continue
+        }
+
+        if ([char]::IsLowSurrogate($unit)) {
+            continue
+        }
+
+        $value = [int]$unit
+        if ($value -eq 0x9 -or $value -eq 0xA -or $value -eq 0xD -or
+            ($value -ge 0x20 -and $value -le 0xD7FF) -or
+            ($value -ge 0xE000 -and $value -le 0xFFFD)) {
+            [void]$xmlText.Append($unit)
+        }
+    }
+
+    $singleLine = [regex]::Replace($xmlText.ToString(), "\s+", " ").Trim()
+    $elementStarts = [Globalization.StringInfo]::ParseCombiningCharacters($singleLine)
+    if ($elementStarts.Count -le $MaxLength) {
         return $singleLine
     }
 
-    return $singleLine.Substring(0, $MaxLength - 3) + "..."
+    return $singleLine.Substring(0, $elementStarts[$MaxLength - 3]) + "..."
 }
 
 function Get-ToastAppId {
@@ -264,7 +293,7 @@ try {
         $activationUri = ""
         $target = Get-ForegroundWindowTarget
         $activationContext = Get-CodexToastActivationContext
-        if ($null -ne $target -and $activationContext.Installed) {
+        if ($null -ne $target -and $activationContext.Installed -and $activationContext.Current) {
             try {
                 $activationUri = New-CodexToastActivationUri -Target $target -Context $activationContext
             }
@@ -277,6 +306,9 @@ try {
     }
     else {
         $rawInput = [Console]::In.ReadToEnd()
+        if ($rawInput.Length -gt 0 -and [int]$rawInput[0] -eq 0xFEFF) {
+            $rawInput = $rawInput.Substring(1)
+        }
         $hookInput = $rawInput | ConvertFrom-Json
         $eventName = [string]$hookInput.hook_event_name
         $sessionId = [string]$hookInput.session_id
@@ -316,7 +348,7 @@ try {
                 $title = [string]$turnState.title
 
                 $activationContext = Get-CodexToastActivationContext
-                if ($activationContext.Installed -and
+                if ($activationContext.Installed -and $activationContext.Current -and
                     [long]$turnState.hwnd -gt 0 -and
                     [long]$turnState.pid -gt 0 -and
                     [long]$turnState.started_utc_ticks -gt 0) {

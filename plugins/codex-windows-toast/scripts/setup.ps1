@@ -24,6 +24,14 @@ $sourceHandler = Join-Path $PSScriptRoot "activate-window.ps1"
 $sourceLauncher = Join-Path $PSScriptRoot "launch-hidden.vbs"
 $sourceCommon = Join-Path $PSScriptRoot "activation-common.ps1"
 $pluginManifest = Join-Path (Split-Path $PSScriptRoot -Parent) ".codex-plugin\plugin.json"
+$ownedRuntimeNames = @(
+    "activate-window.ps1",
+    "launch-hidden.vbs",
+    "activation-common.ps1",
+    "secret.dat",
+    "install.json",
+    "last-activation-status.json"
+)
 
 function Get-SetupStatus {
     $context = Get-CodexToastActivationContext
@@ -40,6 +48,7 @@ function Get-SetupStatus {
 
     return [pscustomobject]@{
         Installed = $context.Installed
+        Current = $context.Current
         Protocol = $script:CodexToastProtocol
         RuntimePath = $runtimePath
         LastActivation = $lastResult
@@ -72,15 +81,7 @@ function Test-OwnedRuntimeDirectory {
         throw "$runtimePath is not owned by this plugin."
     }
 
-    $ownedNames = @(
-        "activate-window.ps1",
-        "launch-hidden.vbs",
-        "activation-common.ps1",
-        "secret.dat",
-        "install.json",
-        "last-activation-status.json"
-    )
-    $unknownEntries = @($entries | Where-Object { $_.Name -notin $ownedNames })
+    $unknownEntries = @($entries | Where-Object { $_.Name -notin $ownedRuntimeNames })
     if ($unknownEntries.Count -ne 0) {
         throw "$runtimePath contains files not owned by this plugin: $($unknownEntries.Name -join ', ')"
     }
@@ -97,31 +98,42 @@ function Test-ProtocolKeyExists {
 }
 
 function Test-OwnedRegistryLayout {
+    param(
+        [switch]$AllowIncomplete,
+        [string[]]$AdditionalOwnedCommands = @()
+    )
+
     $root = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($protocolKey)
     if ($null -eq $root) {
         return $false
     }
 
     try {
-        $command = Get-CodexToastRegisteredCommand
         $ownedCommands = @(
             Get-CodexToastRegistryCommand -LauncherPath $launcherPath
             Get-CodexToastLegacyRegistryCommand -HandlerPath $handlerPath
-        )
-        if ($command -cnotin $ownedCommands) {
-            throw "The existing $script:CodexToastProtocol protocol is not owned by this installation."
-        }
-
-        if (@($root.GetSubKeyNames() | Where-Object { $_ -cne "shell" }).Count -ne 0 -or
-            @($root.GetValueNames() | Where-Object { $_ -cne "" -and $_ -cne "URL Protocol" }).Count -ne 0 -or
-            [string]$root.GetValue("") -cne "URL:Codex Windows Toast" -or
-            [string]$root.GetValue("URL Protocol") -cne "") {
+        ) + @($AdditionalOwnedCommands)
+        $rootSubKeys = @($root.GetSubKeyNames())
+        $rootValueNames = @($root.GetValueNames())
+        if (@($rootSubKeys | Where-Object { $_ -cne "shell" }).Count -ne 0 -or
+            @($rootValueNames | Where-Object { $_ -cne "" -and $_ -cne "URL Protocol" }).Count -ne 0 -or
+            (($rootValueNames -ccontains "") -and [string]$root.GetValue("") -cne "URL:Codex Windows Toast") -or
+            (($rootValueNames -ccontains "URL Protocol") -and [string]$root.GetValue("URL Protocol") -cne "")) {
             throw "The protocol key contains unknown values or subkeys."
+        }
+        if (-not $AllowIncomplete -and
+            (-not ($rootSubKeys -ccontains "shell") -or
+             -not ($rootValueNames -ccontains "") -or
+             -not ($rootValueNames -ccontains "URL Protocol"))) {
+            throw "The protocol registration is incomplete."
         }
 
         foreach ($relativePath in @("shell", "shell\open")) {
             $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$protocolKey\$relativePath")
             if ($null -eq $key) {
+                if ($AllowIncomplete) {
+                    return $true
+                }
                 throw "The protocol registration is incomplete."
             }
             try {
@@ -137,10 +149,26 @@ function Test-OwnedRegistryLayout {
 
         $commandKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$protocolKey\shell\open\command")
         try {
-            if ($null -eq $commandKey -or
-                $commandKey.GetSubKeyNames().Count -ne 0 -or
-                @($commandKey.GetValueNames() | Where-Object { $_ -cne "" }).Count -ne 0) {
+            if ($null -eq $commandKey) {
+                if ($AllowIncomplete) {
+                    return $true
+                }
+                throw "The protocol registration is incomplete."
+            }
+
+            $commandValueNames = @($commandKey.GetValueNames())
+            if ($commandKey.GetSubKeyNames().Count -ne 0 -or
+                @($commandValueNames | Where-Object { $_ -cne "" }).Count -ne 0) {
                 throw "The protocol command key contains unknown content."
+            }
+            if ($commandValueNames -ccontains "") {
+                $command = [string]$commandKey.GetValue("")
+                if ($command -cnotin $ownedCommands) {
+                    throw "The existing $script:CodexToastProtocol protocol is not owned by this installation."
+                }
+            }
+            elseif (-not $AllowIncomplete) {
+                throw "The protocol registration is incomplete."
             }
         }
         finally {
@@ -156,6 +184,94 @@ function Test-OwnedRegistryLayout {
     }
 }
 
+function Set-CodexToastProtocolRegistration {
+    param([Parameter(Mandatory)][string]$Command)
+
+    $root = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($protocolKey)
+    try {
+        $root.SetValue("", "URL:Codex Windows Toast", [Microsoft.Win32.RegistryValueKind]::String)
+        $root.SetValue("URL Protocol", "", [Microsoft.Win32.RegistryValueKind]::String)
+    }
+    finally {
+        $root.Dispose()
+    }
+
+    $commandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$protocolKey\shell\open\command")
+    try {
+        $commandKey.SetValue("", $Command, [Microsoft.Win32.RegistryValueKind]::String)
+    }
+    finally {
+        $commandKey.Dispose()
+    }
+}
+
+function Remove-CodexToastProtocolRegistration {
+    param(
+        [switch]$AllowIncomplete,
+        [string[]]$AdditionalOwnedCommands = @()
+    )
+
+    if (-not (Test-ProtocolKeyExists)) {
+        return
+    }
+
+    [void](Test-OwnedRegistryLayout -AllowIncomplete:$AllowIncomplete -AdditionalOwnedCommands $AdditionalOwnedCommands)
+    foreach ($relativePath in @("shell\open\command", "shell\open", "shell", "")) {
+        $path = if ($relativePath) { "$protocolKey\$relativePath" } else { $protocolKey }
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path)
+        if ($null -eq $key) {
+            continue
+        }
+        $key.Dispose()
+        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($path, $false)
+    }
+}
+
+function New-CodexToastSecretFile {
+    param([Parameter(Mandatory)][string]$Path)
+
+    Add-Type -AssemblyName System.Security -ErrorAction Stop
+    $secret = New-Object byte[] 32
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $generator.GetBytes($secret)
+        $protected = [Security.Cryptography.ProtectedData]::Protect(
+            $secret,
+            $null,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        [Convert]::ToBase64String($protected) | Set-Content -LiteralPath $Path -Encoding ASCII
+    }
+    finally {
+        $generator.Dispose()
+        [Array]::Clear($secret, 0, $secret.Length)
+    }
+}
+
+function Remove-CodexToastTransactionDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+
+    $directory = Get-Item -Force -LiteralPath $Path
+    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Path is a reparse point and will not be removed."
+    }
+
+    $entries = @(Get-ChildItem -Force -LiteralPath $Path)
+    $unknownEntries = @($entries | Where-Object { $_.Name -notin $ownedRuntimeNames -or $_.PSIsContainer })
+    if ($unknownEntries.Count -ne 0) {
+        throw "$Path contains unknown transaction files: $($unknownEntries.Name -join ', ')"
+    }
+
+    foreach ($entry in $entries) {
+        Remove-Item -LiteralPath $entry.FullName -Force
+    }
+    Remove-Item -LiteralPath $Path -Force
+}
+
 function Install-ActivationComponent {
     foreach ($sourcePath in @($sourceHandler, $sourceLauncher, $sourceCommon, $pluginManifest)) {
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
@@ -163,72 +279,141 @@ function Install-ActivationComponent {
         }
     }
 
+    $sourceComponent = Get-CodexToastActivationComponent -BasePath $PSScriptRoot
+    $registryExisted = Test-ProtocolKeyExists
     Test-OwnedRuntimeDirectory
-    if (Test-ProtocolKeyExists) {
+    if ($registryExisted) {
         if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
             throw "The $script:CodexToastProtocol protocol already exists without this plugin's install record."
         }
         [void](Test-OwnedRegistryLayout)
     }
 
-    if ($PSCmdlet.ShouldProcess($runtimePath, "Install window activation files")) {
-        New-Item -ItemType Directory -Path $runtimePath -Force | Out-Null
-        Copy-Item -LiteralPath $sourceHandler -Destination $handlerPath -Force
-        Copy-Item -LiteralPath $sourceLauncher -Destination $launcherPath -Force
-        Copy-Item -LiteralPath $sourceCommon -Destination $commonPath -Force
-
-        if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
-            Add-Type -AssemblyName System.Security -ErrorAction Stop
-            $secret = New-Object byte[] 32
-            $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
-            try {
-                $generator.GetBytes($secret)
-                $protected = [Security.Cryptography.ProtectedData]::Protect(
-                    $secret,
-                    $null,
-                    [Security.Cryptography.DataProtectionScope]::CurrentUser
-                )
-                [Convert]::ToBase64String($protected) | Set-Content -LiteralPath $secretPath -Encoding ASCII
-            }
-            finally {
-                $generator.Dispose()
-                [Array]::Clear($secret, 0, $secret.Length)
-            }
-        }
-    }
-
     $command = Get-CodexToastRegistryCommand -LauncherPath $launcherPath
-    if ($PSCmdlet.ShouldProcess("HKCU\$protocolKey", "Register the $script:CodexToastProtocol URI protocol")) {
-        $root = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($protocolKey)
-        try {
-            $root.SetValue("", "URL:Codex Windows Toast", [Microsoft.Win32.RegistryValueKind]::String)
-            $root.SetValue("URL Protocol", "", [Microsoft.Win32.RegistryValueKind]::String)
-        }
-        finally {
-            $root.Dispose()
-        }
-
-        $commandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$protocolKey\shell\open\command")
-        try {
-            $commandKey.SetValue("", $command, [Microsoft.Win32.RegistryValueKind]::String)
-        }
-        finally {
-            $commandKey.Dispose()
-        }
+    $filesApproved = $PSCmdlet.ShouldProcess($runtimePath, "Install window activation files transactionally")
+    $registryApproved = $PSCmdlet.ShouldProcess("HKCU\$protocolKey", "Register the $script:CodexToastProtocol URI protocol")
+    if (-not ($filesApproved -and $registryApproved)) {
+        return Get-SetupStatus
     }
 
-    if ($PSCmdlet.ShouldProcess($recordPath, "Write the activation install record")) {
+    $transactionId = [Guid]::NewGuid().ToString("N")
+    $runtimeParent = Split-Path $runtimePath -Parent
+    $stagePath = Join-Path $runtimeParent "CodexWindowsToast.stage-$transactionId"
+    $backupPath = Join-Path $runtimeParent "CodexWindowsToast.backup-$transactionId"
+    $previousCommand = if ($registryExisted) { Get-CodexToastRegisteredCommand } else { $null }
+    $oldRuntimeMoved = $false
+    $newRuntimeMoved = $false
+    $registryAttempted = $false
+    $preserveTransactionDirectories = $false
+
+    try {
+        New-Item -ItemType Directory -Path $stagePath | Out-Null
+        Copy-Item -LiteralPath $sourceHandler -Destination (Join-Path $stagePath "activate-window.ps1")
+        Copy-Item -LiteralPath $sourceLauncher -Destination (Join-Path $stagePath "launch-hidden.vbs")
+        Copy-Item -LiteralPath $sourceCommon -Destination (Join-Path $stagePath "activation-common.ps1")
+
+        $stagedSecretPath = Join-Path $stagePath "secret.dat"
+        if (Test-Path -LiteralPath $secretPath -PathType Leaf) {
+            Copy-Item -LiteralPath $secretPath -Destination $stagedSecretPath
+        }
+        else {
+            New-CodexToastSecretFile -Path $stagedSecretPath
+        }
+
+        $lastStatusPath = Join-Path $runtimePath "last-activation-status.json"
+        if (Test-Path -LiteralPath $lastStatusPath -PathType Leaf) {
+            Copy-Item -LiteralPath $lastStatusPath -Destination (Join-Path $stagePath "last-activation-status.json")
+        }
+
+        $stagedComponent = Get-CodexToastActivationComponent -BasePath $stagePath
+        if ($stagedComponent.Fingerprint -cne $sourceComponent.Fingerprint) {
+            throw "The staged activation component does not match the plugin source."
+        }
+
         $manifest = Get-Content -Raw -LiteralPath $pluginManifest | ConvertFrom-Json
-        [ordered]@{
-            schema_version = 1
+        $installRecord = [ordered]@{
+            schema_version = $script:CodexToastActivationRecordSchemaVersion
             owner = $script:CodexToastOwner
             protocol = $script:CodexToastProtocol
             plugin_version = [string]$manifest.version
+            activation_component_version = $stagedComponent.Version
+            activation_component_fingerprint = $stagedComponent.Fingerprint
+            file_hashes = $stagedComponent.FileHashes
             handler_path = $handlerPath
             launcher_path = $launcherPath
+            common_path = $commonPath
             command = $command
             installed_at = [DateTimeOffset]::Now.ToString("o")
-        } | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding UTF8
+        }
+        $stagedRecordPath = Join-Path $stagePath "install.json"
+        $installRecord | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $stagedRecordPath -Encoding UTF8
+        $verifiedRecord = Get-Content -Raw -LiteralPath $stagedRecordPath | ConvertFrom-Json
+        Test-CodexToastActivationComponentRecord -Record $verifiedRecord -Component $stagedComponent
+
+        if (Test-Path -LiteralPath $runtimePath -PathType Container) {
+            Move-Item -LiteralPath $runtimePath -Destination $backupPath
+            $oldRuntimeMoved = $true
+        }
+        Move-Item -LiteralPath $stagePath -Destination $runtimePath
+        $newRuntimeMoved = $true
+
+        $registryAttempted = $true
+        Set-CodexToastProtocolRegistration -Command $command
+
+        $context = Get-CodexToastActivationContext
+        if (-not $context.Installed -or -not $context.Current) {
+            throw "Activation component validation failed: $($context.Error)"
+        }
+    }
+    catch {
+        $installError = $_.Exception
+        $rollbackErrors = New-Object Collections.Generic.List[string]
+
+        if ($registryAttempted) {
+            try {
+                if ($registryExisted) {
+                    Set-CodexToastProtocolRegistration -Command $previousCommand
+                }
+                else {
+                    Remove-CodexToastProtocolRegistration -AllowIncomplete -AdditionalOwnedCommands @($command)
+                }
+            }
+            catch {
+                $rollbackErrors.Add("registry: $($_.Exception.Message)")
+            }
+        }
+
+        try {
+            if ($newRuntimeMoved -and (Test-Path -LiteralPath $runtimePath -PathType Container)) {
+                Move-Item -LiteralPath $runtimePath -Destination $stagePath
+                $newRuntimeMoved = $false
+            }
+            if ($oldRuntimeMoved -and (Test-Path -LiteralPath $backupPath -PathType Container)) {
+                Move-Item -LiteralPath $backupPath -Destination $runtimePath
+                $oldRuntimeMoved = $false
+            }
+        }
+        catch {
+            $rollbackErrors.Add("runtime: $($_.Exception.Message)")
+        }
+
+        if ($rollbackErrors.Count -ne 0) {
+            $preserveTransactionDirectories = $true
+            throw "Activation installation failed: $($installError.Message) Rollback also failed: $($rollbackErrors -join '; '). Transaction paths were preserved: $stagePath, $backupPath"
+        }
+        throw $installError
+    }
+    finally {
+        if (-not $preserveTransactionDirectories) {
+            foreach ($path in @($stagePath, $backupPath)) {
+                try {
+                    Remove-CodexToastTransactionDirectory -Path $path
+                }
+                catch {
+                    Write-Warning $_.Exception.Message
+                }
+            }
+        }
     }
 
     Get-SetupStatus
@@ -277,23 +462,12 @@ function Uninstall-ActivationComponent {
     $registryExists = Test-OwnedRegistryLayout
 
     if ($registryExists -and $PSCmdlet.ShouldProcess("HKCU\$protocolKey", "Remove the owned URI protocol registration")) {
-        foreach ($relativePath in @("shell\open\command", "shell\open", "shell", "")) {
-            $path = if ($relativePath) { "$protocolKey\$relativePath" } else { $protocolKey }
-            [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($path, $false)
-        }
+        Remove-CodexToastProtocolRegistration
     }
 
     Remove-PluginState
 
-    $ownedFiles = @(
-        "activate-window.ps1",
-        "launch-hidden.vbs",
-        "activation-common.ps1",
-        "secret.dat",
-        "install.json",
-        "last-activation-status.json"
-    )
-    foreach ($name in $ownedFiles) {
+    foreach ($name in $ownedRuntimeNames) {
         $path = Join-Path $runtimePath $name
         if ((Test-Path -LiteralPath $path -PathType Leaf) -and
             $PSCmdlet.ShouldProcess($path, "Remove activation component file")) {
