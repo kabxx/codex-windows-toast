@@ -61,6 +61,48 @@ function Get-ToastAppId {
     return $null
 }
 
+function Get-ToastActionLabels {
+    param(
+        [string]$CultureName = [Globalization.CultureInfo]::CurrentUICulture.Name
+    )
+
+    try {
+        $language = ([Globalization.CultureInfo]::GetCultureInfo($CultureName)).TwoLetterISOLanguageName.ToLowerInvariant()
+    }
+    catch {
+        $language = "en"
+    }
+
+    switch ($language) {
+        "ar" { return @{ Return = "&#x0631;&#x062C;&#x0648;&#x0639;"; Dismiss = "&#x0625;&#x063A;&#x0644;&#x0627;&#x0642;" } }
+        "cs" { return @{ Return = "Zp&#x011B;t"; Dismiss = "Zav&#x0159;&#x00ED;t" } }
+        "da" { return @{ Return = "Tilbage"; Dismiss = "Luk" } }
+        "de" { return @{ Return = "Zur&#x00FC;ck"; Dismiss = "Schlie&#x00DF;en" } }
+        "es" { return @{ Return = "Volver"; Dismiss = "Cerrar" } }
+        "fi" { return @{ Return = "Takaisin"; Dismiss = "Sulje" } }
+        "fr" { return @{ Return = "Retour"; Dismiss = "Fermer" } }
+        "he" { return @{ Return = "&#x05D7;&#x05D6;&#x05E8;&#x05D4;"; Dismiss = "&#x05E1;&#x05D2;&#x05D5;&#x05E8;" } }
+        "hi" { return @{ Return = "&#x0935;&#x093E;&#x092A;&#x0938;"; Dismiss = "&#x092C;&#x0902;&#x0926;" } }
+        "id" { return @{ Return = "Kembali"; Dismiss = "Tutup" } }
+        "it" { return @{ Return = "Indietro"; Dismiss = "Chiudi" } }
+        "ja" { return @{ Return = "&#x623B;&#x308B;"; Dismiss = "&#x9589;&#x3058;&#x308B;" } }
+        "ko" { return @{ Return = "&#xB3CC;&#xC544;&#xAC00;&#xAE30;"; Dismiss = "&#xB2EB;&#xAE30;" } }
+        "nb" { return @{ Return = "Tilbake"; Dismiss = "Lukk" } }
+        "nl" { return @{ Return = "Terug"; Dismiss = "Sluiten" } }
+        "no" { return @{ Return = "Tilbake"; Dismiss = "Lukk" } }
+        "pl" { return @{ Return = "Wr&#x00F3;&#x0107;"; Dismiss = "Zamknij" } }
+        "pt" { return @{ Return = "Voltar"; Dismiss = "Fechar" } }
+        "ru" { return @{ Return = "&#x041D;&#x0430;&#x0437;&#x0430;&#x0434;"; Dismiss = "&#x0417;&#x0430;&#x043A;&#x0440;&#x044B;&#x0442;&#x044C;" } }
+        "sv" { return @{ Return = "Tillbaka"; Dismiss = "St&#x00E4;ng" } }
+        "th" { return @{ Return = "&#x0E01;&#x0E25;&#x0E31;&#x0E1A;"; Dismiss = "&#x0E1B;&#x0E34;&#x0E14;" } }
+        "tr" { return @{ Return = "D&#x00F6;n"; Dismiss = "Kapat" } }
+        "uk" { return @{ Return = "&#x041D;&#x0430;&#x0437;&#x0430;&#x0434;"; Dismiss = "&#x0417;&#x0430;&#x043A;&#x0440;&#x0438;&#x0442;&#x0438;" } }
+        "vi" { return @{ Return = "Quay l&#x1EA1;i"; Dismiss = "B&#x1ECF; qua" } }
+        "zh" { return @{ Return = "&#x8FD4;&#x56DE;"; Dismiss = "&#x5FFD;&#x7565;" } }
+        default { return @{ Return = "Return"; Dismiss = "Dismiss" } }
+    }
+}
+
 function Get-PluginDataPath {
     $pluginData = [Environment]::GetEnvironmentVariable("PLUGIN_DATA")
     if ([string]::IsNullOrWhiteSpace($pluginData)) {
@@ -162,11 +204,12 @@ function Send-CodexToast {
     if (-not [string]::IsNullOrWhiteSpace($ActivationUri)) {
         $escapedActivationUri = [System.Security.SecurityElement]::Escape($ActivationUri)
         $ignoredUri = [System.Security.SecurityElement]::Escape("${script:CodexToastProtocol}://ignore")
+        $actionLabels = Get-ToastActionLabels
         $toastAttributes += " launch=`"$ignoredUri`" activationType=`"protocol`""
         $actionsXml = @"
     <actions>
-      <action content="&#x8DF3;&#x8F6C;" arguments="$escapedActivationUri" activationType="protocol" />
-      <action content="&#x5FFD;&#x7565;" arguments="dismiss" activationType="system" />
+      <action content="$($actionLabels.Return)" arguments="$escapedActivationUri" activationType="protocol" />
+      <action content="$($actionLabels.Dismiss)" arguments="dismiss" activationType="system" />
     </actions>
 "@
     }

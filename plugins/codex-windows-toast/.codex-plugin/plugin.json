@@ -1,6 +1,6 @@
 {
   "name": "codex-windows-toast",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Show an actionable Windows toast when a Codex CLI turn ends.",
   "author": {
     "name": "wxh"

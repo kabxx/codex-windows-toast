@@ -1,14 +1,17 @@
 # Codex Windows Toast
 
+[English](README.md) | [简体中文](docs/README.zh-CN.md)
+
 `codex-windows-toast` is a Windows-only Codex CLI plugin. It sends one native
 Windows toast whenever the main agent finishes a turn and returns control to
 the user. The toast title is the current user prompt, and its body is the final
 assistant message for that turn. Notifications use Windows' `long` duration
-and can include two actions:
+and can include two actions. Their labels follow the current Windows display
+language, with concise English labels as the fallback:
 
-- **跳转** restores and activates the top-level window that was in front when
+- **Return** restores and activates the top-level window that was in front when
   the prompt was submitted.
-- **忽略** dismisses the notification.
+- **Dismiss** dismisses the notification.
 
 It does not notify for mid-turn approval requests. Disabling the plugin disables
 the notification hooks. The plugin uses Windows' built-in toast APIs and does
@@ -19,19 +22,21 @@ not require an additional PowerShell module.
 - Windows 10 or Windows 11
 - Codex CLI with plugin support
 
-## Install From A Local Checkout
+## Install
 
-Run these commands from the repository root:
+Add the GitHub repository as a Codex plugin marketplace, then install the
+plugin:
 
 ```powershell
-codex plugin marketplace add .
+codex plugin marketplace add kabxx/codex-windows-toast
 codex plugin add codex-windows-toast@codex-windows-toast
 ```
 
-After this repository is published on GitHub, it can also be added directly:
+For development from a local checkout, run this from the repository root
+instead:
 
 ```powershell
-codex plugin marketplace add <owner>/codex-windows-toast
+codex plugin marketplace add .
 codex plugin add codex-windows-toast@codex-windows-toast
 ```
 
@@ -39,9 +44,9 @@ Start a new Codex CLI session, run `/hooks`, then review and trust the plugin's
 `UserPromptSubmit` and `Stop` hooks. Codex requires this review before local or
 third-party hooks can run.
 
-## Enable The Jump Button
+## Enable Window Return
 
-The notification hook works without system registration. The **跳转** button is
+The notification hook works without system registration. The **Return** button is
 opt-in because Windows requires a per-user URI protocol handler for a toast
 button to launch code. Review the script, preview its changes, then install it:
 
