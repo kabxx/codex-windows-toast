@@ -21,6 +21,9 @@ namespace CodexWindowsToast {
 
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("kernel32.dll")]
+        public static extern ushort GetUserDefaultUILanguage();
     }
 }
 "@
@@ -61,9 +64,31 @@ function Get-ToastAppId {
     return $null
 }
 
+function Get-WindowsUserUICultureName {
+    try {
+        $languageId = [CodexWindowsToast.WindowCapture]::GetUserDefaultUILanguage()
+        if ($languageId -ne 0) {
+            return ([Globalization.CultureInfo]::GetCultureInfo([int]$languageId)).Name
+        }
+    }
+    catch {
+    }
+
+    try {
+        $cultureName = [Globalization.CultureInfo]::CurrentCulture.Name
+        if (-not [string]::IsNullOrWhiteSpace($cultureName)) {
+            return $cultureName
+        }
+    }
+    catch {
+    }
+
+    return "en"
+}
+
 function Get-ToastActionLabels {
     param(
-        [string]$CultureName = [Globalization.CultureInfo]::CurrentUICulture.Name
+        [string]$CultureName = (Get-WindowsUserUICultureName)
     )
 
     try {
