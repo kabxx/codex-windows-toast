@@ -45,6 +45,24 @@ codex plugin add codex-windows-toast@codex-windows-toast
 `UserPromptSubmit` 和 `Stop` Hook。Codex 要求用户在本地或第三方 Hook 首次
 运行前完成审核。
 
+## 避免重复通知
+
+Codex TUI 通知默认处于启用状态。在 WezTerm 等支持桌面通知的终端中，一轮
+任务完成时可能因此额外出现一条由终端发送的 Toast，且不包含本插件的
+**返回**和**忽略**按钮。
+
+要让本插件负责任务完成通知，同时保留 Codex 的审批和 Plan 模式提醒，请在
+`%USERPROFILE%\.codex\config.toml` 现有的 `[tui]` 配置块中设置
+`notifications`；如果该配置块不存在，再创建它：
+
+```toml
+[tui]
+notifications = ["approval-requested", "plan-mode-prompt"]
+```
+
+不要通过删除 `[tui]` 配置块来关闭这些通知：省略该设置时，`notifications`
+会使用默认值 `true`。修改配置后，请启动新的 Codex CLI 会话。
+
 ## 启用窗口返回
 
 通知 Hook 无需系统注册即可工作。**返回**按钮需要用户主动启用，因为

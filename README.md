@@ -52,6 +52,27 @@ Start a new Codex CLI session, run `/hooks`, then review and trust the plugin's
 `UserPromptSubmit` and `Stop` hooks. Codex requires this review before local or
 third-party hooks can run.
 
+## Avoid Duplicate Notifications
+
+Codex TUI notifications are enabled by default. In terminals that support
+desktop notifications, such as WezTerm, a completed turn can therefore produce
+a second terminal-sourced toast without the plugin's **Return** and **Dismiss**
+actions.
+
+To let this plugin handle turn-complete notifications while retaining Codex's
+approval and Plan mode prompts, set `notifications` in the existing `[tui]`
+table in `%USERPROFILE%\.codex\config.toml`, or create the table if it is not
+present:
+
+```toml
+[tui]
+notifications = ["approval-requested", "plan-mode-prompt"]
+```
+
+Do not remove the `[tui]` section to disable these notifications: when the
+setting is omitted, `notifications` defaults to `true`. Start a new Codex CLI
+session after changing the configuration.
+
 ## Enable Window Return
 
 The notification hook works without system registration. The **Return** button is
