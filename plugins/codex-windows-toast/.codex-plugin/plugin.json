@@ -1,6 +1,6 @@
 {
   "name": "codex-windows-toast",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "description": "Show an actionable Windows toast when a Codex CLI turn ends.",
   "author": {
     "name": "wxh"
@@ -13,8 +13,8 @@
   ],
   "interface": {
     "displayName": "Codex Windows Toast",
-    "shortDescription": "Notify when Codex finishes and return to its window.",
-    "longDescription": "Sends a native Windows toast after the main Codex CLI agent finishes a turn, with an optional action that returns to the window where the prompt was submitted.",
+    "shortDescription": "Notify when Codex finishes and return to its window group.",
+    "longDescription": "Sends a native Windows toast after the main Codex CLI agent finishes a turn, with an optional action that returns to the window or Windows 11 Snap Group where the prompt was submitted.",
     "developerName": "wxh",
     "category": "Productivity",
     "capabilities": [],

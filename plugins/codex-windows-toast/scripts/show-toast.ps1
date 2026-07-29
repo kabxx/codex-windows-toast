@@ -9,10 +9,34 @@ $ErrorActionPreference = "Stop"
 if (-not ("CodexWindowsToast.WindowCapture" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace CodexWindowsToast {
     public static class WindowCapture {
+        private const uint MonitorDefaultToNearest = 2;
+        private const uint DwmwaExtendedFrameBounds = 9;
+        private const uint DwmwaCloaked = 14;
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private delegate bool IsWindowArrangedProc(IntPtr hWnd);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Rect {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        private sealed class WindowEntry {
+            public IntPtr Handle;
+            public Rect Bounds;
+        }
+
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
@@ -22,8 +46,185 @@ namespace CodexWindowsToast {
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out Rect bounds);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hWnd, uint attribute, out Rect value, int size);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hWnd, uint attribute, out int value, int size);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true)]
+        private static extern IntPtr GetProcAddress(IntPtr module, string procedureName);
+
         [DllImport("kernel32.dll")]
         public static extern ushort GetUserDefaultUILanguage();
+
+        private static readonly IsWindowArrangedProc IsWindowArranged = LoadIsWindowArranged();
+
+        private static IsWindowArrangedProc LoadIsWindowArranged() {
+            try {
+                IntPtr module = GetModuleHandle("user32.dll");
+                IntPtr procedure = module == IntPtr.Zero ? IntPtr.Zero : GetProcAddress(module, "IsWindowArranged");
+                if (procedure != IntPtr.Zero) {
+                    return (IsWindowArrangedProc)Marshal.GetDelegateForFunctionPointer(procedure, typeof(IsWindowArrangedProc));
+                }
+            }
+            catch {
+            }
+
+            return null;
+        }
+
+        public static bool IsWindowArrangedSafe(IntPtr hWnd) {
+            try {
+                return IsWindowArranged != null && IsWindowArranged(hWnd);
+            }
+            catch {
+                return false;
+            }
+        }
+
+        private static bool IsCloaked(IntPtr hWnd) {
+            try {
+                int cloaked;
+                return DwmGetWindowAttribute(hWnd, DwmwaCloaked, out cloaked, sizeof(int)) == 0 && cloaked != 0;
+            }
+            catch {
+                return false;
+            }
+        }
+
+        private static bool TryGetBounds(IntPtr hWnd, out Rect bounds) {
+            try {
+                if (DwmGetWindowAttribute(hWnd, DwmwaExtendedFrameBounds, out bounds, Marshal.SizeOf(typeof(Rect))) == 0 &&
+                    bounds.Right > bounds.Left && bounds.Bottom > bounds.Top) {
+                    return true;
+                }
+            }
+            catch {
+            }
+
+            return GetWindowRect(hWnd, out bounds) && bounds.Right > bounds.Left && bounds.Bottom > bounds.Top;
+        }
+
+        private static double GetVisibleFraction(Rect bounds, List<Rect> higherBounds) {
+            long area = (long)(bounds.Right - bounds.Left) * (bounds.Bottom - bounds.Top);
+            if (area <= 0 || higherBounds.Count == 0) {
+                return 1.0;
+            }
+
+            List<Rect> visible = new List<Rect>();
+            visible.Add(bounds);
+            foreach (Rect higher in higherBounds) {
+                List<Rect> remaining = new List<Rect>();
+                foreach (Rect current in visible) {
+                    int left = Math.Max(current.Left, higher.Left);
+                    int top = Math.Max(current.Top, higher.Top);
+                    int right = Math.Min(current.Right, higher.Right);
+                    int bottom = Math.Min(current.Bottom, higher.Bottom);
+                    if (right <= left || bottom <= top) {
+                        remaining.Add(current);
+                        continue;
+                    }
+
+                    if (current.Top < top) {
+                        remaining.Add(new Rect { Left = current.Left, Top = current.Top, Right = current.Right, Bottom = top });
+                    }
+                    if (bottom < current.Bottom) {
+                        remaining.Add(new Rect { Left = current.Left, Top = bottom, Right = current.Right, Bottom = current.Bottom });
+                    }
+                    if (current.Left < left) {
+                        remaining.Add(new Rect { Left = current.Left, Top = top, Right = left, Bottom = bottom });
+                    }
+                    if (right < current.Right) {
+                        remaining.Add(new Rect { Left = right, Top = top, Right = current.Right, Bottom = bottom });
+                    }
+                }
+
+                visible = remaining;
+                if (visible.Count == 0) {
+                    return 0.0;
+                }
+            }
+
+            long visibleArea = 0;
+            foreach (Rect current in visible) {
+                visibleArea += (long)(current.Right - current.Left) * (current.Bottom - current.Top);
+            }
+            return visibleArea / (double)area;
+        }
+
+        public static IntPtr[] GetSnapGroupWindows(IntPtr target, int maximumCount) {
+            if (target == IntPtr.Zero || maximumCount < 1 || !IsWindowArrangedSafe(target)) {
+                return target == IntPtr.Zero ? new IntPtr[0] : new IntPtr[] { target };
+            }
+
+            IntPtr targetMonitor = MonitorFromWindow(target, MonitorDefaultToNearest);
+            List<WindowEntry> candidates = new List<WindowEntry>();
+            EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                if (!IsWindowVisible(hWnd) || IsIconic(hWnd) || IsCloaked(hWnd) ||
+                    !IsWindowArrangedSafe(hWnd) || MonitorFromWindow(hWnd, MonitorDefaultToNearest) != targetMonitor) {
+                    return true;
+                }
+
+                Rect bounds;
+                if (TryGetBounds(hWnd, out bounds)) {
+                    WindowEntry entry = new WindowEntry();
+                    entry.Handle = hWnd;
+                    entry.Bounds = bounds;
+                    candidates.Add(entry);
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            int targetIndex = candidates.FindIndex(delegate(WindowEntry entry) { return entry.Handle == target; });
+            if (targetIndex < 0) {
+                return new IntPtr[] { target };
+            }
+
+            List<IntPtr> selected = new List<IntPtr>();
+            List<Rect> higherBounds = new List<Rect>();
+            for (int index = 0; index < candidates.Count; index++) {
+                WindowEntry candidate = candidates[index];
+                double visibleFraction = GetVisibleFraction(candidate.Bounds, higherBounds);
+                higherBounds.Add(candidate.Bounds);
+
+                if (index < targetIndex) {
+                    continue;
+                }
+                if (index > targetIndex && visibleFraction < 0.90) {
+                    break;
+                }
+
+                selected.Add(candidate.Handle);
+                if (selected.Count == maximumCount) {
+                    break;
+                }
+            }
+
+            return selected.Count == 0 ? new IntPtr[] { target } : selected.ToArray();
+        }
     }
 }
 "@
@@ -177,11 +378,33 @@ function Get-SessionStatePath {
     return Join-Path (Get-PluginDataPath) "turn-$safeSessionId.json"
 }
 
-function Get-ForegroundWindowTarget {
+function Get-WindowTarget {
+    param([Parameter(Mandatory)][IntPtr]$Window)
+
+    try {
+        [uint32]$processId = 0
+        [void][CodexWindowsToast.WindowCapture]::GetWindowThreadProcessId($Window, [ref]$processId)
+        if ($processId -eq 0) {
+            return $null
+        }
+
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        return [pscustomobject]@{
+            hwnd = $Window.ToInt64()
+            pid = [long]$processId
+            started_utc_ticks = $process.StartTime.ToUniversalTime().Ticks
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ForegroundWindowTargets {
     try {
         $window = [CodexWindowsToast.WindowCapture]::GetForegroundWindow()
         if ($window -eq [IntPtr]::Zero) {
-            return $null
+            return
         }
 
         $rootWindow = [CodexWindowsToast.WindowCapture]::GetAncestor($window, 2)
@@ -189,21 +412,21 @@ function Get-ForegroundWindowTarget {
             $window = $rootWindow
         }
 
-        [uint32]$processId = 0
-        [void][CodexWindowsToast.WindowCapture]::GetWindowThreadProcessId($window, [ref]$processId)
-        if ($processId -eq 0) {
-            return $null
-        }
+        $windows = [CodexWindowsToast.WindowCapture]::GetSnapGroupWindows($window, 8)
+        for ($index = 0; $index -lt $windows.Count; $index++) {
+            $target = Get-WindowTarget -Window $windows[$index]
+            if ($null -eq $target) {
+                if ($index -eq 0) {
+                    return
+                }
+                continue
+            }
 
-        $process = Get-Process -Id $processId -ErrorAction Stop
-        return [pscustomobject]@{
-            hwnd = $window.ToInt64()
-            pid = [long]$processId
-            started_utc_ticks = $process.StartTime.ToUniversalTime().Ticks
+            Write-Output $target
         }
     }
     catch {
-        return $null
+        return
     }
 }
 
@@ -291,11 +514,11 @@ $actionsXml
 try {
     if ($Test) {
         $activationUri = ""
-        $target = Get-ForegroundWindowTarget
+        $targets = @(Get-ForegroundWindowTargets)
         $activationContext = Get-CodexToastActivationContext
-        if ($null -ne $target -and $activationContext.Installed -and $activationContext.Current) {
+        if ($targets.Count -gt 0 -and $activationContext.Installed -and $activationContext.Current) {
             try {
-                $activationUri = New-CodexToastActivationUri -Target $target -Context $activationContext
+                $activationUri = New-CodexToastActivationUri -Targets $targets -Context $activationContext
             }
             catch {
                 $activationUri = ""
@@ -317,18 +540,16 @@ try {
         if ($eventName -eq "UserPromptSubmit") {
             $pluginData = Get-PluginDataPath
             New-Item -ItemType Directory -Path $pluginData -Force | Out-Null
-            $target = Get-ForegroundWindowTarget
+            $targets = @(Get-ForegroundWindowTargets)
             $turnState = [ordered]@{
                 turn_id = $turnId
                 title = ConvertTo-ToastText -Text ([string]$hookInput.prompt) -MaxLength 120
             }
-            if ($null -ne $target) {
-                $turnState.hwnd = $target.hwnd
-                $turnState.pid = $target.pid
-                $turnState.started_utc_ticks = $target.started_utc_ticks
+            if ($targets.Count -gt 0) {
+                $turnState.targets = $targets
             }
 
-            $turnState | ConvertTo-Json | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
+            $turnState | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
             Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "prompt-saved"
             [Console]::Out.WriteLine('{"continue":true}')
             exit 0
@@ -348,17 +569,19 @@ try {
                 $title = [string]$turnState.title
 
                 $activationContext = Get-CodexToastActivationContext
-                if ($activationContext.Installed -and $activationContext.Current -and
-                    [long]$turnState.hwnd -gt 0 -and
-                    [long]$turnState.pid -gt 0 -and
+                $targets = @($turnState.targets)
+                if ($targets.Count -eq 0 -and
+                    [long]$turnState.hwnd -gt 0 -and [long]$turnState.pid -gt 0 -and
                     [long]$turnState.started_utc_ticks -gt 0) {
-                    $target = [pscustomobject]@{
+                    $targets = @([pscustomobject]@{
                         hwnd = [long]$turnState.hwnd
                         pid = [long]$turnState.pid
                         started_utc_ticks = [long]$turnState.started_utc_ticks
-                    }
+                    })
+                }
+                if ($activationContext.Installed -and $activationContext.Current -and $targets.Count -gt 0) {
                     try {
-                        $activationUri = New-CodexToastActivationUri -Target $target -Context $activationContext
+                        $activationUri = New-CodexToastActivationUri -Targets $targets -Context $activationContext
                     }
                     catch {
                         $activationUri = ""

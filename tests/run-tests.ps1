@@ -8,6 +8,8 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $scriptRoot = Join-Path $repoRoot "plugins\codex-windows-toast\scripts"
 $showToastPath = Join-Path $scriptRoot "show-toast.ps1"
 $commonPath = Join-Path $scriptRoot "activation-common.ps1"
+$activatorPath = Join-Path $scriptRoot "activate-window.ps1"
+$launcherPath = Join-Path $scriptRoot "launch-hidden.vbs"
 
 function Assert-Equal {
     param(
@@ -128,6 +130,93 @@ $record.activation_component_fingerprint = "invalid"
 Assert-Throws -Action {
     Test-CodexToastActivationComponentRecord -Record $record -Component $component
 } -Name "activation fingerprint validation"
+
+$activationTargets = @(
+    [pscustomobject]@{ hwnd = 101; pid = 201; started_utc_ticks = 301 }
+    [pscustomobject]@{ hwnd = 102; pid = 202; started_utc_ticks = 302 }
+)
+$encodedTargets = ConvertTo-CodexToastActivationTargets -Targets $activationTargets
+Assert-Equal -Expected "101.201.301~102.202.302" -Actual $encodedTargets -Name "activation targets serialization"
+$decodedTargets = @(ConvertFrom-CodexToastActivationTargets -Value $encodedTargets)
+Assert-Equal -Expected 2 -Actual $decodedTargets.Count -Name "activation targets count"
+Assert-Equal -Expected 101 -Actual ([long]$decodedTargets[0].hwnd) -Name "primary target hwnd"
+Assert-Equal -Expected 202 -Actual ([long]$decodedTargets[1].pid) -Name "secondary target pid"
+Assert-Equal -Expected 302 -Actual ([long]$decodedTargets[1].started_utc_ticks) -Name "secondary target start time"
+
+$duplicateTargets = @(
+    [pscustomobject]@{ hwnd = 101; pid = 201; started_utc_ticks = 301 }
+    [pscustomobject]@{ hwnd = 101; pid = 202; started_utc_ticks = 302 }
+)
+$tooManyTargets = 1..9 | ForEach-Object {
+    [pscustomobject]@{ hwnd = $_; pid = 200 + $_; started_utc_ticks = 300 + $_ }
+}
+Assert-Throws -Action {
+    ConvertTo-CodexToastActivationTargets -Targets @()
+} -Name "empty activation targets"
+Assert-Throws -Action {
+    ConvertTo-CodexToastActivationTargets -Targets @([pscustomobject]@{ hwnd = 0; pid = 1; started_utc_ticks = 1 })
+} -Name "non-positive activation target hwnd"
+Assert-Throws -Action {
+    ConvertTo-CodexToastActivationTargets -Targets @([pscustomobject]@{ hwnd = 1; pid = 0; started_utc_ticks = 1 })
+} -Name "non-positive activation target pid"
+Assert-Throws -Action {
+    ConvertTo-CodexToastActivationTargets -Targets @([pscustomobject]@{ hwnd = 1; pid = 1; started_utc_ticks = 0 })
+} -Name "non-positive activation target start time"
+Assert-Throws -Action {
+    ConvertTo-CodexToastActivationTargets -Targets $duplicateTargets
+} -Name "duplicate activation target hwnd"
+Assert-Throws -Action {
+    ConvertTo-CodexToastActivationTargets -Targets $tooManyTargets
+} -Name "activation target count limit"
+foreach ($invalidTargets in @(
+    "",
+    "0.2.3",
+    "01.2.3",
+    "1.2.3~1.4.5",
+    "1.2.3~4.5.6&extra=7",
+    "999999999999999999999.2.3",
+    "1.2.3~4.5.6~7.8.9~10.11.12~13.14.15~16.17.18~19.20.21~22.23.24~25.26.27"
+)) {
+    Assert-Throws -Action {
+        ConvertFrom-CodexToastActivationTargets -Value $invalidTargets
+    } -Name "invalid activation targets '$invalidTargets'"
+}
+
+$secretPath = [IO.Path]::GetTempFileName()
+$secret = [Text.Encoding]::UTF8.GetBytes("codex-window-target-test-secret-32")
+try {
+    Add-Type -AssemblyName System.Security -ErrorAction Stop
+    $protectedSecret = [Security.Cryptography.ProtectedData]::Protect(
+        $secret,
+        $null,
+        [Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    [Convert]::ToBase64String($protectedSecret) | Set-Content -LiteralPath $secretPath -Encoding ASCII
+    $activationUri = New-CodexToastActivationUri -Targets $activationTargets -Context ([pscustomobject]@{
+        SecretPath = $secretPath
+    })
+    Assert-Equal -Expected $true -Actual ([bool]($activationUri -cmatch '^codex-windows-toast://activate\?v=2&targets=101\.201\.301~102\.202\.302&sig=[0-9a-f]{64}$')) -Name "v2 activation URI"
+}
+finally {
+    [Array]::Clear($secret, 0, $secret.Length)
+    Remove-Item -LiteralPath $secretPath -Force -ErrorAction SilentlyContinue
+}
+
+$launcherText = Get-Content -Raw -LiteralPath $launcherPath
+Assert-Equal -Expected $true -Actual ([bool]($launcherText -cmatch 'v=2&targets=')) -Name "launcher accepts v2 targets"
+Assert-Equal -Expected $false -Actual ([bool]($launcherText -cmatch 'v=1&hwnd=')) -Name "launcher rejects legacy v1 URI"
+$activatorText = Get-Content -Raw -LiteralPath $activatorPath
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'IsWindowArranged')) -Name "activator checks arranged windows"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'SetWindowPos')) -Name "activator raises group members"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\[IntPtr\]\(-1\)')) -Name "activator temporarily marks group members topmost"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\[IntPtr\]\(-2\)')) -Name "activator clears temporary topmost state"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'group-activated')) -Name "activator records group activation"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '(?s)while \(\$restoreTimer\.ElapsedMilliseconds.*?IsIconic.*?Start-Sleep')) -Name "activator waits for restored windows"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '(?s)while \(-not \$activated.*?SetForegroundWindow.*?GetForegroundWindow')) -Name "activator retries foreground activation"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\$retryIntervalMilliseconds = 50')) -Name "activator uses bounded retry interval"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\$restoreTimeoutMilliseconds = 500')) -Name "activator bounds restore wait"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\$activationTimeoutMilliseconds = 1000')) -Name "activator bounds activation retries"
+Assert-Equal -Expected $false -Actual ([bool]($activatorText -cmatch 'Start-Sleep -Milliseconds (75|150)')) -Name "activator avoids fixed restore and verification delays"
 
 if ($Integration) {
     $testData = Join-Path ([IO.Path]::GetTempPath()) "codex-windows-toast-$([Guid]::NewGuid().ToString('N'))"

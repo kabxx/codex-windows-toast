@@ -251,13 +251,91 @@ function Test-CodexToastSignature {
     return $difference -eq 0
 }
 
+function ConvertTo-CodexToastActivationTargets {
+    param(
+        [Parameter(Mandatory)][object[]]$Targets
+    )
+
+    $items = @($Targets)
+    if ($items.Count -lt 1 -or $items.Count -gt 8) {
+        throw "Activation targets must contain between 1 and 8 windows."
+    }
+
+    $seenWindows = @{}
+    $records = foreach ($target in $items) {
+        $hwndText = [string]$target.hwnd
+        $processIdText = [string]$target.pid
+        $startedText = [string]$target.started_utc_ticks
+        [long]$window = 0
+        [uint32]$processId = 0
+        [long]$started = 0
+        if ($hwndText -notmatch "^[1-9][0-9]{0,18}$" -or
+            $processIdText -notmatch "^[1-9][0-9]{0,9}$" -or
+            $startedText -notmatch "^[1-9][0-9]{0,18}$" -or
+            -not [long]::TryParse($hwndText, [ref]$window) -or
+            -not [uint32]::TryParse($processIdText, [ref]$processId) -or
+            -not [long]::TryParse($startedText, [ref]$started) -or
+            $window -le 0 -or $processId -eq 0 -or $started -le 0) {
+            throw "Invalid activation target."
+        }
+
+        if ($seenWindows.ContainsKey($hwndText)) {
+            throw "Duplicate activation target."
+        }
+        $seenWindows[$hwndText] = $true
+
+        "$hwndText.$processIdText.$startedText"
+    }
+
+    return $records -join "~"
+}
+
+function ConvertFrom-CodexToastActivationTargets {
+    param(
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    if ($Value -notmatch "^[1-9][0-9]{0,18}\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,18}(~[1-9][0-9]{0,18}\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,18}){0,7}$") {
+        throw "Invalid activation targets."
+    }
+
+    $seenWindows = @{}
+    $targets = foreach ($record in $Value.Split("~")) {
+        $parts = $record.Split(".")
+        [long]$window = 0
+        [uint32]$processId = 0
+        [long]$started = 0
+        if ($parts.Count -ne 3 -or
+            -not [long]::TryParse($parts[0], [ref]$window) -or
+            -not [uint32]::TryParse($parts[1], [ref]$processId) -or
+            -not [long]::TryParse($parts[2], [ref]$started) -or
+            $window -le 0 -or $processId -eq 0 -or $started -le 0) {
+            throw "Invalid activation target."
+        }
+
+        if ($seenWindows.ContainsKey($parts[0])) {
+            throw "Duplicate activation target."
+        }
+        $seenWindows[$parts[0]] = $true
+
+        [pscustomobject]@{
+            hwnd = $window
+            pid = [long]$processId
+            started_utc_ticks = $started
+        }
+    }
+
+    return $targets
+}
+
 function New-CodexToastActivationUri {
     param(
-        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)][object[]]$Targets,
         [Parameter(Mandatory)]$Context
     )
 
-    $payload = "v=1&hwnd=$($Target.hwnd)&pid=$($Target.pid)&started=$($Target.started_utc_ticks)"
+    $serializedTargets = ConvertTo-CodexToastActivationTargets -Targets $Targets
+    $payload = "v=2&targets=$serializedTargets"
     $secret = Get-CodexToastSecret -Path $Context.SecretPath
     try {
         $signature = Get-CodexToastHmacHex -Key $secret -Payload $payload

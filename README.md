@@ -12,7 +12,9 @@ and can include two actions. Their labels follow the current Windows display
 language, with concise English labels as the fallback:
 
 - **Return** restores and activates the top-level window that was in front when
-  the prompt was submitted.
+  the prompt was submitted. On Windows 11, if that window belongs to a Snap
+  Group, the plugin also attempts to restore and bring forward all currently
+  visible members of that group before focusing the original window.
 - **Dismiss** dismisses the notification.
 
 It does not notify for mid-turn approval requests. Disabling the plugin disables
@@ -99,19 +101,25 @@ Installation creates only these user-scoped artifacts:
 It does not install a service, scheduled task, startup item, or background
 process. The protocol starts through Windows' built-in `wscript.exe`, which
 launches the PowerShell activation handler without opening a console window.
-The URI contains only a signed window handle, process ID, and process start
-time; it never contains prompt or response text. If the activation component
-is absent or invalid, notifications continue without action buttons.
+The URI contains only signed window handles, process IDs, and process start
+times for one or more windows; it never contains prompt or response text. If
+the activation component is absent or invalid, notifications continue without
+action buttons.
 
 `-Status` reports both `Installed` and `Current`. After a plugin update, rerun
 `-Install` when `Current` is `False`; the notification hook continues without
 action buttons until the runtime component matches the installed plugin.
+Existing window-return installations must rerun `setup.ps1 -Install` after
+updating to a build that includes Snap Group support.
 
 The button targets the captured top-level window, such as Windows Terminal or
-VS Code; it does not select a terminal tab or editor terminal. Activation on the
-current virtual desktop is supported. Windows may reject or decline to switch
-to a window on another virtual desktop, so cross-desktop activation is best
-effort.
+VS Code; it does not select a terminal tab or editor terminal. A window outside
+a Snap Group keeps the existing single-window behavior. Snap Group membership
+is inferred on a best-effort basis from public Win32 arranged-window state,
+window geometry, and visibility. Nonstandard or partially obscured layouts may
+therefore fall back to fewer windows. Activation on the current virtual desktop
+is supported. Windows may reject or decline to switch to a window on another
+virtual desktop, so cross-desktop activation is also best effort.
 
 ## Uninstall
 
