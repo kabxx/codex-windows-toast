@@ -101,12 +101,38 @@ function ConvertFrom-CodexToastQuery {
         $values[$parts[0]] = [Uri]::UnescapeDataString($parts[1])
     }
 
-    $expectedNames = @("v", "targets", "sig")
-    if ($values.Count -ne $expectedNames.Count -or @($expectedNames | Where-Object { -not $values.ContainsKey($_) }).Count -ne 0) {
+    return $values
+}
+
+function Test-CodexToastQueryFields {
+    param(
+        [Parameter(Mandatory)][hashtable]$Values,
+        [Parameter(Mandatory)][string[]]$ExpectedNames
+    )
+
+    if ($Values.Count -ne $ExpectedNames.Count -or
+        @($ExpectedNames | Where-Object { -not $Values.ContainsKey($_) }).Count -ne 0) {
         throw "Unexpected activation query fields."
     }
+}
 
-    return $values
+$activationClaim = $null
+$activationRecordId = ""
+
+function Write-CodexToastCurrentActivationStatus {
+    param(
+        [Parameter(Mandatory)][string]$Result,
+        [AllowEmptyString()][string]$Detail = "",
+        [AllowEmptyString()][string]$TerminalProvider = "",
+        [AllowEmptyString()][string]$TerminalResult = ""
+    )
+
+    Write-CodexToastActivationStatus `
+        -Result $Result `
+        -Detail $Detail `
+        -TerminalProvider $TerminalProvider `
+        -TerminalResult $TerminalResult `
+        -ActivationId $activationRecordId
 }
 
 try {
@@ -124,48 +150,82 @@ try {
     }
 
     $query = ConvertFrom-CodexToastQuery -Uri $uri
-    if ($query.v -cne "2" -or $query.sig -notmatch "^[0-9a-f]{64}$") {
+    if ($query.sig -notmatch "^[0-9a-f]{64}$") {
         throw "Invalid activation values."
     }
-    $targets = @(ConvertFrom-CodexToastActivationTargets -Value $query.targets)
 
     $context = Get-CodexToastActivationContext
-    if (-not $context.Installed) {
+    if (-not $context.Installed -or -not $context.Current) {
         throw $context.Error
     }
 
-    $serializedTargets = ConvertTo-CodexToastActivationTargets -Targets $targets
-    $payload = "v=2&targets=$serializedTargets"
-    $secret = Get-CodexToastSecret -Path $context.SecretPath
-    try {
-        $expectedSignature = Get-CodexToastHmacHex -Key $secret -Payload $payload
-    }
-    finally {
-        [Array]::Clear($secret, 0, $secret.Length)
-    }
+    $terminal = $null
+    if ($query.v -ceq "2") {
+        Test-CodexToastQueryFields -Values $query -ExpectedNames @("v", "targets", "sig")
+        $targets = @(ConvertFrom-CodexToastActivationTargets -Value $query.targets)
+        $serializedTargets = ConvertTo-CodexToastActivationTargets -Targets $targets
+        $payload = "v=2&targets=$serializedTargets"
+        $secret = Get-CodexToastSecret -Path $context.SecretPath
+        try {
+            $expectedSignature = Get-CodexToastHmacHex -Key $secret -Payload $payload
+        }
+        finally {
+            [Array]::Clear($secret, 0, $secret.Length)
+        }
 
-    if (-not (Test-CodexToastSignature -Expected $expectedSignature -Actual $query.sig)) {
-        throw "Invalid activation signature."
+        if (-not (Test-CodexToastSignature -Expected $expectedSignature -Actual $query.sig)) {
+            throw "Invalid activation signature."
+        }
+    }
+    elseif ($query.v -ceq "3") {
+        Test-CodexToastQueryFields -Values $query -ExpectedNames @("v", "id", "sig")
+        if ($query.id -notmatch "^[0-9a-f]{32}$") {
+            throw "Invalid activation values."
+        }
+
+        $activationRecordId = $query.id
+        $activationClaim = Enter-CodexToastActivationClaim `
+            -Id $query.id `
+            -Signature $query.sig `
+            -Context $context
+        $activationRecord = $activationClaim.Record
+        $targets = @($activationRecord.targets)
+        $terminal = $activationRecord.terminal
+    }
+    else {
+        throw "Invalid activation values."
     }
 
     $primary = $targets[0]
     $window = [IntPtr]([long]$primary.hwnd)
     $processId = [uint32]$primary.pid
     if (-not [CodexWindowsToast.WindowActivator]::IsWindow($window)) {
-        Write-CodexToastActivationStatus -Result "target-missing"
+        if ($null -ne $activationClaim) {
+            Complete-CodexToastActivationClaim -Id $activationRecordId -Context $context -Claim $activationClaim
+            $activationClaim = $null
+        }
+        Write-CodexToastCurrentActivationStatus -Result "target-missing"
         exit 0
     }
 
     [uint32]$windowProcessId = 0
     [void][CodexWindowsToast.WindowActivator]::GetWindowThreadProcessId($window, [ref]$windowProcessId)
     if ($windowProcessId -ne $processId) {
-        Write-CodexToastActivationStatus -Result "target-changed"
+        if ($null -ne $activationClaim) {
+            Complete-CodexToastActivationClaim -Id $activationRecordId -Context $context -Claim $activationClaim
+            $activationClaim = $null
+        }
+        Write-CodexToastCurrentActivationStatus -Result "target-changed"
         exit 0
     }
 
     $process = Get-Process -Id $processId -ErrorAction Stop
     if ($process.StartTime.ToUniversalTime().Ticks -ne [long]$primary.started_utc_ticks) {
-        Write-CodexToastActivationStatus -Result "target-changed"
+        if ($null -ne $activationClaim) {
+            Complete-CodexToastActivationClaim -Id $activationRecordId -Context $context -Claim $activationClaim
+            $activationClaim = $null
+        }
+        Write-CodexToastCurrentActivationStatus -Result "target-changed"
         exit 0
     }
 
@@ -257,18 +317,64 @@ try {
     }
 
     if ($activated) {
+        $terminalActivation = if ($null -ne $terminal) {
+            . (Join-Path $PSScriptRoot "terminal-providers.ps1")
+            Invoke-CodexToastTerminalActivation -Terminal $terminal -Target $primary
+        }
+        else {
+            $null
+        }
         $result = if ($windows.Count -gt 1) { "group-activated" } else { "activated" }
-        Write-CodexToastActivationStatus -Result $result
+        if ($null -ne $terminalActivation) {
+            $statusResult = $result
+            if ([string]$terminalActivation.Status -eq "failed") {
+                $statusResult = "$result-terminal-failed"
+            }
+            elseif ([string]$terminalActivation.Status -eq "stale") {
+                $statusResult = "$result-terminal-stale"
+            }
+            Write-CodexToastCurrentActivationStatus `
+                -Result $statusResult `
+                -Detail ([string]$terminalActivation.Detail) `
+                -TerminalProvider ([string]$terminalActivation.Provider) `
+                -TerminalResult ([string]$terminalActivation.Status)
+            if ([string]$terminalActivation.Status -eq "failed") {
+                Release-CodexToastActivationClaim -Claim $activationClaim
+            }
+            else {
+                Complete-CodexToastActivationClaim -Id $activationRecordId -Context $context -Claim $activationClaim
+            }
+            $activationClaim = $null
+        }
+        else {
+            Write-CodexToastCurrentActivationStatus -Result $result
+            if ($null -ne $activationClaim) {
+                Complete-CodexToastActivationClaim -Id $activationRecordId -Context $context -Claim $activationClaim
+                $activationClaim = $null
+            }
+        }
     }
     elseif ($requested) {
-        Write-CodexToastActivationStatus -Result "activation-requested" -Detail "Windows did not switch to the target window."
+        if ($null -ne $activationClaim) {
+            Release-CodexToastActivationClaim -Claim $activationClaim
+            $activationClaim = $null
+        }
+        Write-CodexToastCurrentActivationStatus -Result "activation-requested" -Detail "Windows did not switch to the target window."
     }
     else {
-        Write-CodexToastActivationStatus -Result "activation-blocked" -Detail "Windows rejected the foreground request."
+        if ($null -ne $activationClaim) {
+            Release-CodexToastActivationClaim -Claim $activationClaim
+            $activationClaim = $null
+        }
+        Write-CodexToastCurrentActivationStatus -Result "activation-blocked" -Detail "Windows rejected the foreground request."
     }
 }
 catch {
-    Write-CodexToastActivationStatus -Result "invalid-request" -Detail $_.Exception.Message
+    if ($null -ne $activationClaim) {
+        Release-CodexToastActivationClaim -Claim $activationClaim
+        $activationClaim = $null
+    }
+    Write-CodexToastCurrentActivationStatus -Result "invalid-request" -Detail $_.Exception.Message
 }
 
 exit 0

@@ -18,7 +18,7 @@ activationUri = WScript.Arguments(0)
 Set pattern = New RegExp
 pattern.Global = False
 pattern.IgnoreCase = False
-pattern.Pattern = "^codex-windows-toast://ignore/?$|^codex-windows-toast://activate/?\?v=2&targets=[1-9][0-9]{0,18}\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,18}(~[1-9][0-9]{0,18}\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,18}){0,7}&sig=[0-9a-f]{64}$"
+pattern.Pattern = "^codex-windows-toast://ignore/?$|^codex-windows-toast://activate/?\?v=2&targets=[1-9][0-9]{0,18}\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,18}(~[1-9][0-9]{0,18}\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,18}){0,7}&sig=[0-9a-f]{64}$|^codex-windows-toast://activate/?\?v=3&id=[0-9a-f]{32}&sig=[0-9a-f]{64}$"
 If Not pattern.Test(activationUri) Then
     WScript.Quit 0
 End If

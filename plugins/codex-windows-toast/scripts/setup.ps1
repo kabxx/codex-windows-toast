@@ -20,18 +20,21 @@ $commonPath = Join-Path $runtimePath "activation-common.ps1"
 $secretPath = Join-Path $runtimePath "secret.dat"
 $recordPath = Join-Path $runtimePath "install.json"
 $protocolKey = "Software\Classes\$script:CodexToastProtocol"
-$sourceHandler = Join-Path $PSScriptRoot "activate-window.ps1"
-$sourceLauncher = Join-Path $PSScriptRoot "launch-hidden.vbs"
-$sourceCommon = Join-Path $PSScriptRoot "activation-common.ps1"
 $pluginManifest = Join-Path (Split-Path $PSScriptRoot -Parent) ".codex-plugin\plugin.json"
-$ownedRuntimeNames = @(
-    "activate-window.ps1",
-    "launch-hidden.vbs",
-    "activation-common.ps1",
+$providerFileNames = @($script:CodexToastActivationFileNames | Where-Object {
+    (Split-Path $_ -Parent) -ceq "providers"
+} | ForEach-Object {
+    [IO.Path]::GetFileName($_)
+})
+$ownedRuntimeFileNames = @($script:CodexToastActivationFileNames | Where-Object {
+    [string]::IsNullOrEmpty((Split-Path $_ -Parent))
+}) + @(
     "secret.dat",
     "install.json",
     "last-activation-status.json"
 )
+$ownedRuntimeDirectoryNames = @("providers", "activations")
+$ownedRuntimeNames = @($ownedRuntimeFileNames) + @($ownedRuntimeDirectoryNames)
 
 function Get-SetupStatus {
     $context = Get-CodexToastActivationContext
@@ -56,17 +59,99 @@ function Get-SetupStatus {
     }
 }
 
+function Get-OwnedRuntimeChildEntries {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet("providers", "activations")][string]$Kind
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "$Path must be a directory."
+    }
+
+    $directory = Get-Item -Force -LiteralPath $Path
+    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Path is a reparse point and will not be modified."
+    }
+
+    $entries = @(Get-ChildItem -Force -LiteralPath $Path)
+    if ($Kind -ceq "providers") {
+        $unknownEntries = @($entries | Where-Object {
+            $_.PSIsContainer -or
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $_.Name -cnotin $providerFileNames
+        })
+    }
+    else {
+        $unknownEntries = @($entries | Where-Object {
+            $_.PSIsContainer -or
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $_.Name -cnotmatch "^[0-9a-f]{32}\.(json|tmp)$" -or
+            $_.Length -gt $script:CodexToastActivationRecordMaxBytes
+        })
+    }
+
+    if ($unknownEntries.Count -ne 0) {
+        throw "$Path contains files not owned by this plugin: $($unknownEntries.Name -join ', ')"
+    }
+    return $entries
+}
+
+function Test-OwnedRuntimeLayout {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return @()
+    }
+
+    $directory = Get-Item -Force -LiteralPath $Path
+    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Path is a reparse point and will not be modified."
+    }
+
+    $entries = @(Get-ChildItem -Force -LiteralPath $Path)
+    $unknownEntries = @($entries | Where-Object {
+        $_.Name -cnotin $ownedRuntimeNames -or
+        ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($_.PSIsContainer -and $_.Name -cnotin $ownedRuntimeDirectoryNames) -or
+        (-not $_.PSIsContainer -and $_.Name -cnotin $ownedRuntimeFileNames)
+    })
+    if ($unknownEntries.Count -ne 0) {
+        throw "$Path contains files not owned by this plugin: $($unknownEntries.Name -join ', ')"
+    }
+
+    foreach ($name in $ownedRuntimeDirectoryNames) {
+        [void]@(Get-OwnedRuntimeChildEntries -Path (Join-Path $Path $name) -Kind $name)
+    }
+    return $entries
+}
+
+function Copy-OwnedActivationRecords {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Container)) {
+        return
+    }
+
+    foreach ($entry in @(Get-OwnedRuntimeChildEntries -Path $SourcePath -Kind "activations")) {
+        if ($entry.Name -cmatch "^[0-9a-f]{32}\.json$") {
+            Copy-Item -LiteralPath $entry.FullName -Destination (Join-Path $DestinationPath $entry.Name)
+        }
+    }
+}
+
 function Test-OwnedRuntimeDirectory {
     if (-not (Test-Path -LiteralPath $runtimePath -PathType Container)) {
         return
     }
 
-    $runtimeDirectory = Get-Item -Force -LiteralPath $runtimePath
-    if (($runtimeDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$runtimePath is a reparse point and will not be modified."
-    }
-
-    $entries = @(Get-ChildItem -Force -LiteralPath $runtimePath)
+    $entries = @(Test-OwnedRuntimeLayout -Path $runtimePath)
     if ($entries.Count -eq 0) {
         return
     }
@@ -79,11 +164,6 @@ function Test-OwnedRuntimeDirectory {
     if ([string]$record.owner -cne $script:CodexToastOwner -or
         [string]$record.protocol -cne $script:CodexToastProtocol) {
         throw "$runtimePath is not owned by this plugin."
-    }
-
-    $unknownEntries = @($entries | Where-Object { $_.Name -notin $ownedRuntimeNames })
-    if ($unknownEntries.Count -ne 0) {
-        throw "$runtimePath contains files not owned by this plugin: $($unknownEntries.Name -join ', ')"
     }
 }
 
@@ -255,25 +335,29 @@ function Remove-CodexToastTransactionDirectory {
         return
     }
 
-    $directory = Get-Item -Force -LiteralPath $Path
-    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Path is a reparse point and will not be removed."
+    $entries = @(Test-OwnedRuntimeLayout -Path $Path)
+    foreach ($name in $ownedRuntimeDirectoryNames) {
+        $childPath = Join-Path $Path $name
+        if (-not (Test-Path -LiteralPath $childPath -PathType Container)) {
+            continue
+        }
+        foreach ($entry in @(Get-OwnedRuntimeChildEntries -Path $childPath -Kind $name)) {
+            Remove-Item -LiteralPath $entry.FullName -Force
+        }
+        Remove-Item -LiteralPath $childPath -Force
     }
 
-    $entries = @(Get-ChildItem -Force -LiteralPath $Path)
-    $unknownEntries = @($entries | Where-Object { $_.Name -notin $ownedRuntimeNames -or $_.PSIsContainer })
-    if ($unknownEntries.Count -ne 0) {
-        throw "$Path contains unknown transaction files: $($unknownEntries.Name -join ', ')"
-    }
-
-    foreach ($entry in $entries) {
+    foreach ($entry in @($entries | Where-Object { -not $_.PSIsContainer })) {
         Remove-Item -LiteralPath $entry.FullName -Force
     }
     Remove-Item -LiteralPath $Path -Force
 }
 
 function Install-ActivationComponent {
-    foreach ($sourcePath in @($sourceHandler, $sourceLauncher, $sourceCommon, $pluginManifest)) {
+    $sourcePaths = @($script:CodexToastActivationFileNames | ForEach-Object {
+        Join-Path $PSScriptRoot $_
+    }) + @($pluginManifest)
+    foreach ($sourcePath in $sourcePaths) {
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
             throw "Required source file is missing: $sourcePath"
         }
@@ -308,9 +392,17 @@ function Install-ActivationComponent {
 
     try {
         New-Item -ItemType Directory -Path $stagePath | Out-Null
-        Copy-Item -LiteralPath $sourceHandler -Destination (Join-Path $stagePath "activate-window.ps1")
-        Copy-Item -LiteralPath $sourceLauncher -Destination (Join-Path $stagePath "launch-hidden.vbs")
-        Copy-Item -LiteralPath $sourceCommon -Destination (Join-Path $stagePath "activation-common.ps1")
+        foreach ($relativePath in $script:CodexToastActivationFileNames) {
+            $destinationPath = Join-Path $stagePath $relativePath
+            $destinationDirectory = Split-Path $destinationPath -Parent
+            if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $destinationDirectory | Out-Null
+            }
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot $relativePath) -Destination $destinationPath
+        }
+
+        $stagedActivationsPath = Join-Path $stagePath "activations"
+        New-Item -ItemType Directory -Path $stagedActivationsPath | Out-Null
 
         $stagedSecretPath = Join-Path $stagePath "secret.dat"
         if (Test-Path -LiteralPath $secretPath -PathType Leaf) {
@@ -353,6 +445,9 @@ function Install-ActivationComponent {
         if (Test-Path -LiteralPath $runtimePath -PathType Container) {
             Move-Item -LiteralPath $runtimePath -Destination $backupPath
             $oldRuntimeMoved = $true
+            Copy-OwnedActivationRecords `
+                -SourcePath (Join-Path $backupPath "activations") `
+                -DestinationPath $stagedActivationsPath
         }
         Move-Item -LiteralPath $stagePath -Destination $runtimePath
         $newRuntimeMoved = $true
@@ -467,7 +562,21 @@ function Uninstall-ActivationComponent {
 
     Remove-PluginState
 
-    foreach ($name in $ownedRuntimeNames) {
+    foreach ($name in $ownedRuntimeDirectoryNames) {
+        $path = Join-Path $runtimePath $name
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            continue
+        }
+        $entries = @(Get-OwnedRuntimeChildEntries -Path $path -Kind $name)
+        if ($PSCmdlet.ShouldProcess($path, "Remove activation component directory")) {
+            foreach ($entry in $entries) {
+                Remove-Item -LiteralPath $entry.FullName -Force
+            }
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+
+    foreach ($name in $ownedRuntimeFileNames) {
         $path = Join-Path $runtimePath $name
         if ((Test-Path -LiteralPath $path -PathType Leaf) -and
             $PSCmdlet.ShouldProcess($path, "Remove activation component file")) {

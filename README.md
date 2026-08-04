@@ -12,9 +12,10 @@ and can include two actions. Their labels follow the current Windows display
 language, with concise English labels as the fallback:
 
 - **Return** restores and activates the top-level window that was in front when
-  the prompt was submitted. On Windows 11, if that window belongs to a Snap
-  Group, the plugin also attempts to restore and bring forward all currently
-  visible members of that group before focusing the original window.
+  the prompt was submitted, then restores the originating terminal target when
+  an exact built-in provider is available. On Windows 11, if that window belongs
+  to a Snap Group, the plugin also attempts to restore and bring forward all
+  currently visible members of that group before focusing the original window.
 - **Dismiss** dismisses the notification.
 
 It does not notify for mid-turn approval requests. Disabling the plugin disables
@@ -101,25 +102,52 @@ Installation creates only these user-scoped artifacts:
 It does not install a service, scheduled task, startup item, or background
 process. The protocol starts through Windows' built-in `wscript.exe`, which
 launches the PowerShell activation handler without opening a console window.
-The URI contains only signed window handles, process IDs, and process start
-times for one or more windows; it never contains prompt or response text. If
-the activation component is absent or invalid, notifications continue without
-action buttons.
+The URI contains only an opaque activation-record ID and a signature. The
+short-lived local record contains validated window identities and, when
+supported, a terminal locator; it never contains prompt or response text. A
+record expires after seven days and is deleted after successful authentication.
+If the activation component is absent or invalid, notifications continue
+without action buttons.
 
 `-Status` reports both `Installed` and `Current`. After a plugin update, rerun
 `-Install` when `Current` is `False`; the notification hook continues without
 action buttons until the runtime component matches the installed plugin.
-Existing window-return installations must rerun `setup.ps1 -Install` after
-updating to a build that includes Snap Group support.
+Updates that change activation behavior require a fresh `setup.ps1 -Install`;
+`-Status` reports this as `Current: False`.
 
-The button targets the captured top-level window, such as Windows Terminal or
-VS Code; it does not select a terminal tab or editor terminal. A window outside
-a Snap Group keeps the existing single-window behavior. Snap Group membership
-is inferred on a best-effort basis from public Win32 arranged-window state,
-window geometry, and visibility. Nonstandard or partially obscured layouts may
-therefore fall back to fewer windows. Activation on the current virtual desktop
-is supported. Windows may reject or decline to switch to a window on another
-virtual desktop, so cross-desktop activation is also best effort.
+### Terminal target restoration
+
+After restoring the validated top-level window, the activation handler supports
+these built-in targets without companion plugins:
+
+- **WezTerm:** restores the exact captured pane and its tab through WezTerm's
+  own socket and CLI. A closed pane, restarted mux, or mismatched window falls
+  back to the outer window.
+- **Windows Terminal:** selects the exact captured live UI Automation tab and,
+  when it remains identifiable, its pane. It never guesses by title or tab
+  index and never invokes `wt.exe` to create or find a window.
+- **tmux in WSL:** when nested in a captured WezTerm or Windows Terminal target,
+  restores the exact existing client, session, window, and pane after strict
+  server and process checks. It requires `/usr/bin/tmux` and never creates or
+  scans for a tmux server. The hook process must receive `TMUX`, `TMUX_PANE`,
+  and `WSL_DISTRO_NAME`; when launching Windows Codex from WSL, configure
+  `WSLENV` before starting Codex, for example:
+
+  ```sh
+  export WSLENV="${WSLENV:+$WSLENV:}TMUX/w:TMUX_PANE/w:WSL_DISTRO_NAME/w"
+  ```
+
+VS Code, Zed, and terminals without an exact built-in provider use window-only
+activation. Unsupported, stale, ambiguous, or failed terminal targets also stop
+at the restored window without changing, opening, or closing a terminal panel.
+
+A window outside a Snap Group keeps the existing single-window behavior. Snap
+Group membership is inferred on a best-effort basis from public Win32
+arranged-window state, window geometry, and visibility. Nonstandard or partially
+obscured layouts may therefore fall back to fewer windows. Activation on the
+current virtual desktop is supported. Windows may reject or decline to switch
+to a window on another virtual desktop, so cross-desktop activation is also best
+effort.
 
 ## Uninstall
 

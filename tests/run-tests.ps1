@@ -10,6 +10,9 @@ $showToastPath = Join-Path $scriptRoot "show-toast.ps1"
 $commonPath = Join-Path $scriptRoot "activation-common.ps1"
 $activatorPath = Join-Path $scriptRoot "activate-window.ps1"
 $launcherPath = Join-Path $scriptRoot "launch-hidden.vbs"
+$terminalProvidersPath = Join-Path $scriptRoot "terminal-providers.ps1"
+$windowsTerminalUiaPath = Join-Path $scriptRoot "providers\windows-terminal-uia.ps1"
+$setupPath = Join-Path $scriptRoot "setup.ps1"
 
 function Assert-Equal {
     param(
@@ -118,7 +121,12 @@ $xmlDocument.LoadXml("<toast><text>$([Security.SecurityElement]::Escape($xmlSafe
 Assert-Throws -Action { ConvertTo-ToastText -Text "test" -MaxLength 3 } -Name "minimum length validation"
 
 . $commonPath
+. $terminalProvidersPath
 $component = Get-CodexToastActivationComponent -BasePath $scriptRoot
+Assert-Equal `
+    -Expected $true `
+    -Actual $component.FileHashes.Contains("providers\windows-terminal-uia.ps1") `
+    -Name "Windows Terminal worker participates in component fingerprint"
 $record = [ordered]@{
     schema_version = $script:CodexToastActivationRecordSchemaVersion
     activation_component_version = $component.Version
@@ -182,7 +190,9 @@ foreach ($invalidTargets in @(
     } -Name "invalid activation targets '$invalidTargets'"
 }
 
-$secretPath = [IO.Path]::GetTempFileName()
+$activationRuntime = Join-Path ([IO.Path]::GetTempPath()) "codex-windows-toast-activation-$([Guid]::NewGuid().ToString('N'))"
+[void][IO.Directory]::CreateDirectory($activationRuntime)
+$secretPath = Join-Path $activationRuntime "secret.dat"
 $secret = [Text.Encoding]::UTF8.GetBytes("codex-window-target-test-secret-32")
 try {
     Add-Type -AssemblyName System.Security -ErrorAction Stop
@@ -192,19 +202,226 @@ try {
         [Security.Cryptography.DataProtectionScope]::CurrentUser
     )
     [Convert]::ToBase64String($protectedSecret) | Set-Content -LiteralPath $secretPath -Encoding ASCII
-    $activationUri = New-CodexToastActivationUri -Targets $activationTargets -Context ([pscustomobject]@{
+    $activationContext = [pscustomobject]@{
+        RuntimePath = $activationRuntime
         SecretPath = $secretPath
-    })
-    Assert-Equal -Expected $true -Actual ([bool]($activationUri -cmatch '^codex-windows-toast://activate\?v=2&targets=101\.201\.301~102\.202\.302&sig=[0-9a-f]{64}$')) -Name "v2 activation URI"
+    }
+    $terminalContext = [pscustomobject]@{
+        outer = [pscustomobject]@{
+            provider = "test"
+            version = 1
+            locator = [pscustomobject]@{ value = "target" }
+        }
+        inner = @()
+    }
+    $activationUri = New-CodexToastActivationUri -Targets $activationTargets -Context $activationContext -Terminal $terminalContext
+    Assert-Equal -Expected $true -Actual ([bool]($activationUri -cmatch '^codex-windows-toast://activate\?v=3&id=[0-9a-f]{32}&sig=[0-9a-f]{64}$')) -Name "v3 activation URI"
+
+    $activationMatch = [regex]::Match($activationUri, 'id=([0-9a-f]{32})&sig=([0-9a-f]{64})$')
+    $activationId = $activationMatch.Groups[1].Value
+    $activationSignature = $activationMatch.Groups[2].Value
+    $activationRecordPath = Join-Path (Get-CodexToastActivationRecordDirectory -RuntimePath $activationRuntime) "$activationId.json"
+    Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $activationRecordPath -PathType Leaf) -Name "v3 activation record exists"
+    $loadedActivation = Read-CodexToastActivationRecord -Id $activationId -Signature $activationSignature -Context $activationContext
+    Assert-Equal -Expected 2 -Actual @($loadedActivation.targets).Count -Name "v3 activation target count"
+    Assert-Equal -Expected "test" -Actual ([string]$loadedActivation.terminal.outer.provider) -Name "v3 terminal context"
+    Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $activationRecordPath) -Name "v3 activation record remains before claim"
+    $activationClaim = Enter-CodexToastActivationClaim `
+        -Id $activationId `
+        -Signature $activationSignature `
+        -Context $activationContext
+    Release-CodexToastActivationClaim -Claim $activationClaim
+    Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $activationRecordPath) -Name "failed activation claim keeps record"
+    $activationClaim = Enter-CodexToastActivationClaim `
+        -Id $activationId `
+        -Signature $activationSignature `
+        -Context $activationContext
+    Complete-CodexToastActivationClaim `
+        -Id $activationId `
+        -Context $activationContext `
+        -Claim $activationClaim
+    Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $activationRecordPath) -Name "successful activation claim consumes record"
+    Assert-Throws -Action {
+        Read-CodexToastActivationRecord -Id $activationId -Signature $activationSignature -Context $activationContext
+    } -Name "consumed activation record"
+
+    $tamperedUri = New-CodexToastActivationUri -Targets $activationTargets -Context $activationContext
+    $tamperedMatch = [regex]::Match($tamperedUri, 'id=([0-9a-f]{32})&sig=([0-9a-f]{64})$')
+    $tamperedPath = Join-Path (Get-CodexToastActivationRecordDirectory -RuntimePath $activationRuntime) "$($tamperedMatch.Groups[1].Value).json"
+    [IO.File]::AppendAllText($tamperedPath, " ")
+    Assert-Throws -Action {
+        Read-CodexToastActivationRecord -Id $tamperedMatch.Groups[1].Value -Signature $tamperedMatch.Groups[2].Value -Context $activationContext
+    } -Name "tampered activation record"
+    Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $tamperedPath -PathType Leaf) -Name "unauthenticated record is not consumed"
+
+    $bomUri = New-CodexToastActivationUri -Targets $activationTargets -Context $activationContext
+    $bomMatch = [regex]::Match($bomUri, 'id=([0-9a-f]{32})&sig=([0-9a-f]{64})$')
+    $bomPath = Join-Path (Get-CodexToastActivationRecordDirectory -RuntimePath $activationRuntime) "$($bomMatch.Groups[1].Value).json"
+    $originalBytes = [IO.File]::ReadAllBytes($bomPath)
+    $bomBytes = New-Object byte[] ($originalBytes.Length + 3)
+    $bomBytes[0] = 0xEF
+    $bomBytes[1] = 0xBB
+    $bomBytes[2] = 0xBF
+    [Array]::Copy($originalBytes, 0, $bomBytes, 3, $originalBytes.Length)
+    [IO.File]::WriteAllBytes($bomPath, $bomBytes)
+    Assert-Throws -Action {
+        Read-CodexToastActivationRecord -Id $bomMatch.Groups[1].Value -Signature $bomMatch.Groups[2].Value -Context $activationContext
+    } -Name "activation record rejects BOM"
+    Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $bomPath -PathType Leaf) -Name "BOM record is not consumed"
+
+    $expiredUri = New-CodexToastActivationUri -Targets $activationTargets -Context $activationContext -NowUtc ([DateTime]::UtcNow.AddDays(-8))
+    $expiredMatch = [regex]::Match($expiredUri, 'id=([0-9a-f]{32})&sig=([0-9a-f]{64})$')
+    $expiredPath = Join-Path (Get-CodexToastActivationRecordDirectory -RuntimePath $activationRuntime) "$($expiredMatch.Groups[1].Value).json"
+    Assert-Throws -Action {
+        Read-CodexToastActivationRecord -Id $expiredMatch.Groups[1].Value -Signature $expiredMatch.Groups[2].Value -Context $activationContext
+    } -Name "expired activation record"
+    Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $expiredPath) -Name "authenticated expired record is consumed"
 }
 finally {
     [Array]::Clear($secret, 0, $secret.Length)
-    Remove-Item -LiteralPath $secretPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $activationRuntime -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $launcherText = Get-Content -Raw -LiteralPath $launcherPath
 Assert-Equal -Expected $true -Actual ([bool]($launcherText -cmatch 'v=2&targets=')) -Name "launcher accepts v2 targets"
+Assert-Equal -Expected $true -Actual ([bool]($launcherText -cmatch 'v=3&id=')) -Name "launcher accepts v3 record IDs"
 Assert-Equal -Expected $false -Actual ([bool]($launcherText -cmatch 'v=1&hwnd=')) -Name "launcher rejects legacy v1 URI"
+$providerIds = @((Get-CodexToastTerminalProviders).Id)
+Assert-Equal -Expected 3 -Actual $providerIds.Count -Name "terminal provider registry count"
+Assert-Equal -Expected "wezterm" -Actual $providerIds[0] -Name "WezTerm provider registration"
+Assert-Equal -Expected "windows-terminal" -Actual $providerIds[1] -Name "Windows Terminal provider registration"
+Assert-Equal -Expected "tmux" -Actual $providerIds[2] -Name "tmux provider registration"
+$wezTermLocator = ConvertFrom-CodexToastWezTermLocator -Value ([pscustomobject]@{
+    pane_id = "18"
+    socket_path = "C:\Users\test\wezterm.sock"
+    mux_window_id = "2"
+})
+Assert-Equal -Expected "18" -Actual $wezTermLocator.pane_id -Name "WezTerm pane locator"
+$wezTermJsonRows = @(ConvertFrom-CodexToastWezTermJsonList -Json '[{"pane_id":1},{"pane_id":16}]')
+Assert-Equal -Expected 2 -Actual $wezTermJsonRows.Count -Name "WezTerm JSON list is flat in Windows PowerShell 5.1"
+Assert-Equal -Expected "16" -Actual ([string]$wezTermJsonRows[1].pane_id) -Name "WezTerm JSON list preserves pane rows"
+Assert-Equal `
+    -Expected "18" `
+    -Actual (Resolve-CodexToastWezTermCapturePaneId -EnvironmentPaneId "18" -FocusedPaneId "16" -TmuxAttached $false) `
+    -Name "WezTerm capture uses process pane outside tmux"
+Assert-Equal `
+    -Expected "16" `
+    -Actual (Resolve-CodexToastWezTermCapturePaneId -EnvironmentPaneId "18" -FocusedPaneId "16" -TmuxAttached $true) `
+    -Name "WezTerm capture uses focused client for tmux"
+$wezTermClients = @([pscustomobject]@{ pid = 27564; focused_pane_id = 18 })
+$wezTermPanes = @([pscustomobject]@{ pane_id = 18; window_id = 2 })
+Assert-Equal `
+    -Expected $true `
+    -Actual (Test-CodexToastWezTermActivationState `
+        -Clients $wezTermClients `
+        -Panes $wezTermPanes `
+        -GuiProcessId "27564" `
+        -PaneId "18" `
+        -MuxWindowId "2") `
+    -Name "WezTerm activation confirms pane and mux window"
+Assert-Equal `
+    -Expected $false `
+    -Actual (Test-CodexToastWezTermActivationState `
+        -Clients $wezTermClients `
+        -Panes @([pscustomobject]@{ pane_id = 18; window_id = 3 }) `
+        -GuiProcessId "27564" `
+        -PaneId "18" `
+        -MuxWindowId "2") `
+    -Name "WezTerm activation rejects moved pane"
+Assert-Throws -Action {
+    ConvertFrom-CodexToastWezTermLocator -Value ([pscustomobject]@{
+        pane_id = "18 --config-file bad"
+        socket_path = "C:\Users\test\wezterm.sock"
+        mux_window_id = "2"
+    })
+} -Name "WezTerm locator rejects argument injection"
+Assert-Throws -Action {
+    ConvertFrom-CodexToastWezTermLocator -Value ([pscustomobject]@{
+        pane_id = "18"
+        socket_path = "relative.sock"
+        mux_window_id = "2"
+    })
+} -Name "WezTerm locator rejects relative socket"
+$windowsTerminalLocator = ConvertFrom-CodexToastWindowsTerminalLocator -Value ([pscustomobject]@{
+    session_guid = "12345678-1234-1234-1234-1234567890ab"
+    tab_runtime_id = @(42, -7, 9)
+    pane_runtime_id = @(42, -8, 10)
+})
+Assert-Equal -Expected "12345678-1234-1234-1234-1234567890ab" -Actual $windowsTerminalLocator.session_guid -Name "Windows Terminal session locator"
+Assert-Equal -Expected -7 -Actual ([int]$windowsTerminalLocator.tab_runtime_id[1]) -Name "Windows Terminal tab runtime ID"
+Assert-Throws -Action {
+    ConvertFrom-CodexToastWindowsTerminalLocator -Value ([pscustomobject]@{
+        session_guid = "not-a-guid"
+        tab_runtime_id = @(42, 7)
+        pane_runtime_id = @()
+    })
+} -Name "Windows Terminal locator rejects invalid session"
+Assert-Throws -Action {
+    ConvertFrom-CodexToastWindowsTerminalLocator -Value ([pscustomobject]@{
+        session_guid = "12345678-1234-1234-1234-1234567890ab"
+        tab_runtime_id = @("7; focus-tab")
+        pane_runtime_id = @()
+    })
+} -Name "Windows Terminal locator rejects invalid runtime ID"
+$staleWindowsTerminalResult = Invoke-CodexToastWindowsTerminalActivation -Context ([pscustomobject]@{
+    provider = "windows-terminal"
+    version = 1
+    locator = $windowsTerminalLocator
+}) -Target $activationTargets[0]
+Assert-Equal -Expected "stale" -Actual $staleWindowsTerminalResult.Status -Name "Windows Terminal stale target fallback"
+$tmuxLocator = ConvertFrom-CodexToastTmuxLocator -Value ([pscustomobject]@{
+    transport = "wsl"
+    wsl_distro = "Ubuntu-24.04"
+    socket_path = "/tmp/tmux-1000/default"
+    server_pid = "123"
+    server_started = "1700000000"
+    session_id = '$2'
+    session_created = "1700000001"
+    window_id = '@4'
+    pane_id = '%7'
+    client_name = "/dev/pts/1"
+    client_pid = "456"
+    client_created = "1700000002"
+    client_tty = "/dev/pts/1"
+})
+Assert-Equal -Expected '%7' -Actual $tmuxLocator.pane_id -Name "tmux pane locator"
+Assert-Throws -Action {
+    ConvertFrom-CodexToastTmuxLocator -Value ([pscustomobject]@{
+        transport = "wsl"
+        wsl_distro = "Ubuntu --exec bad"
+        socket_path = "/tmp/tmux-1000/default"
+        server_pid = "123"
+        server_started = "1700000000"
+        session_id = '$2'
+        session_created = "1700000001"
+        window_id = '@4'
+        pane_id = '%7'
+        client_name = "/dev/pts/1"
+        client_pid = "456"
+        client_created = "1700000002"
+        client_tty = "/dev/pts/1"
+    })
+} -Name "tmux locator rejects argument injection"
+$staleTmuxLocator = $tmuxLocator.PSObject.Copy()
+$staleTmuxLocator.wsl_distro = "CodexMissingDistro"
+$staleTmuxResult = Invoke-CodexToastTmuxActivation -Context ([pscustomobject]@{
+    provider = "tmux"
+    version = 1
+    locator = $staleTmuxLocator
+}) -Target $activationTargets[0]
+Assert-Equal -Expected "stale" -Actual $staleTmuxResult.Status -Name "tmux stale distro fallback"
+$unknownTerminalResult = Invoke-CodexToastTerminalActivation -Terminal ([pscustomobject]@{
+    outer = [pscustomobject]@{ provider = "unknown"; version = 1; locator = [pscustomobject]@{} }
+    inner = @()
+}) -Target $activationTargets[0]
+Assert-Equal -Expected "unsupported" -Actual $unknownTerminalResult.Status -Name "unknown provider fallback"
+$innerWithoutOuterResult = Invoke-CodexToastTerminalActivation -Terminal ([pscustomobject]@{
+    outer = $null
+    inner = @([pscustomobject]@{ provider = "tmux"; version = 1; locator = $tmuxLocator })
+}) -Target $activationTargets[0]
+Assert-Equal -Expected "unsupported" -Actual $innerWithoutOuterResult.Status -Name "inner provider requires supported outer"
+$providerText = Get-Content -Raw -LiteralPath $terminalProvidersPath
+Assert-Equal -Expected $false -Actual ([bool]($providerText -cmatch 'Invoke-Expression')) -Name "provider registry avoids dynamic evaluation"
 $activatorText = Get-Content -Raw -LiteralPath $activatorPath
 Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'IsWindowArranged')) -Name "activator checks arranged windows"
 Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'SetWindowPos')) -Name "activator raises group members"
@@ -217,6 +434,103 @@ Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\$retryInte
 Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\$restoreTimeoutMilliseconds = 500')) -Name "activator bounds restore wait"
 Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch '\$activationTimeoutMilliseconds = 1000')) -Name "activator bounds activation retries"
 Assert-Equal -Expected $false -Actual ([bool]($activatorText -cmatch 'Start-Sleep -Milliseconds (75|150)')) -Name "activator avoids fixed restore and verification delays"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'Invoke-CodexToastTerminalActivation')) -Name "activator dispatches terminal providers"
+Assert-Equal -Expected $true -Actual ([bool]($activatorText -cmatch 'Installed -or -not \$context\.Current')) -Name "activator requires current component"
+$windowsTerminalUiaText = Get-Content -Raw -LiteralPath $windowsTerminalUiaPath
+Assert-Equal `
+    -Expected $true `
+    -Actual ([bool]($windowsTerminalUiaText -cmatch 'Test-WorkerDescendant -Root \$RequiredAncestor -Element \$_')) `
+    -Name "Windows Terminal pane must belong to selected tab"
+
+$setupTokens = $null
+$setupParseErrors = $null
+$setupAst = [Management.Automation.Language.Parser]::ParseFile(
+    $setupPath,
+    [ref]$setupTokens,
+    [ref]$setupParseErrors
+)
+if ($setupParseErrors.Count -ne 0) {
+    throw "setup.ps1 has parse errors: $($setupParseErrors.Message -join '; ')"
+}
+$providerFileNames = @($script:CodexToastActivationFileNames | Where-Object {
+    (Split-Path $_ -Parent) -ceq "providers"
+} | ForEach-Object {
+    [IO.Path]::GetFileName($_)
+})
+$ownedRuntimeFileNames = @($script:CodexToastActivationFileNames | Where-Object {
+    [string]::IsNullOrEmpty((Split-Path $_ -Parent))
+}) + @("secret.dat", "install.json", "last-activation-status.json")
+$ownedRuntimeDirectoryNames = @("providers", "activations")
+$ownedRuntimeNames = @($ownedRuntimeFileNames) + @($ownedRuntimeDirectoryNames)
+foreach ($functionName in @(
+    "Get-OwnedRuntimeChildEntries",
+    "Test-OwnedRuntimeLayout",
+    "Copy-OwnedActivationRecords",
+    "Remove-CodexToastTransactionDirectory"
+)) {
+    $definition = $setupAst.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq $functionName
+    }, $true)
+    if ($null -eq $definition) {
+        throw "$functionName was not found in setup.ps1."
+    }
+    Invoke-Expression $definition.Extent.Text
+}
+
+$setupRuntime = Join-Path ([IO.Path]::GetTempPath()) "codex-windows-toast-setup-$([Guid]::NewGuid().ToString('N'))"
+try {
+    $providersDirectory = Join-Path $setupRuntime "providers"
+    $activationsDirectory = Join-Path $setupRuntime "activations"
+    [void][IO.Directory]::CreateDirectory($providersDirectory)
+    [void][IO.Directory]::CreateDirectory($activationsDirectory)
+    foreach ($name in $providerFileNames) {
+        [IO.File]::WriteAllText((Join-Path $providersDirectory $name), "test")
+    }
+    $ownedRecordPath = Join-Path $activationsDirectory "$(('a' * 32)).json"
+    $ownedRecordContent = '{"version":3}'
+    [IO.File]::WriteAllText($ownedRecordPath, $ownedRecordContent)
+    $temporaryRecordPath = Join-Path $activationsDirectory "$(('b' * 32)).tmp"
+    [IO.File]::WriteAllText($temporaryRecordPath, "temporary")
+    [void]@(Test-OwnedRuntimeLayout -Path $setupRuntime)
+
+    $copiedActivationsDirectory = Join-Path $setupRuntime "copied-activations"
+    [void][IO.Directory]::CreateDirectory($copiedActivationsDirectory)
+    Copy-OwnedActivationRecords -SourcePath $activationsDirectory -DestinationPath $copiedActivationsDirectory
+    $copiedRecordPath = Join-Path $copiedActivationsDirectory ([IO.Path]::GetFileName($ownedRecordPath))
+    $copiedTemporaryRecordPath = Join-Path $copiedActivationsDirectory ([IO.Path]::GetFileName($temporaryRecordPath))
+    Assert-Equal `
+        -Expected $ownedRecordContent `
+        -Actual ([IO.File]::ReadAllText($copiedRecordPath)) `
+        -Name "setup preserves activation records during upgrade"
+    Assert-Equal `
+        -Expected $false `
+        -Actual (Test-Path -LiteralPath $copiedTemporaryRecordPath) `
+        -Name "setup does not preserve temporary activation records"
+    Remove-Item -LiteralPath $copiedActivationsDirectory -Recurse -Force
+
+    $unknownProviderPath = Join-Path $providersDirectory "unknown.ps1"
+    [IO.File]::WriteAllText($unknownProviderPath, "test")
+    Assert-Throws -Action {
+        [void]@(Test-OwnedRuntimeLayout -Path $setupRuntime)
+    } -Name "setup rejects unknown provider file"
+    Remove-Item -LiteralPath $unknownProviderPath -Force
+
+    [IO.File]::WriteAllBytes($ownedRecordPath, (New-Object byte[] ($script:CodexToastActivationRecordMaxBytes + 1)))
+    Assert-Throws -Action {
+        [void]@(Test-OwnedRuntimeLayout -Path $setupRuntime)
+    } -Name "setup rejects oversized activation record"
+    [IO.File]::WriteAllText($ownedRecordPath, $ownedRecordContent)
+
+    Remove-CodexToastTransactionDirectory -Path $setupRuntime
+    Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $setupRuntime) -Name "setup removes owned transaction layout"
+}
+finally {
+    if (Test-Path -LiteralPath $setupRuntime) {
+        Remove-Item -LiteralPath $setupRuntime -Recurse -Force
+    }
+}
 
 if ($Integration) {
     $testData = Join-Path ([IO.Path]::GetTempPath()) "codex-windows-toast-$([Guid]::NewGuid().ToString('N'))"

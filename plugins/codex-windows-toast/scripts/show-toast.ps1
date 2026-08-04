@@ -516,9 +516,12 @@ try {
         $activationUri = ""
         $targets = @(Get-ForegroundWindowTargets)
         $activationContext = Get-CodexToastActivationContext
+        $terminal = $null
         if ($targets.Count -gt 0 -and $activationContext.Installed -and $activationContext.Current) {
             try {
-                $activationUri = New-CodexToastActivationUri -Targets $targets -Context $activationContext
+                . (Join-Path $PSScriptRoot "terminal-providers.ps1")
+                $terminal = Get-CodexToastTerminalContext -PrimaryTarget $targets[0]
+                $activationUri = New-CodexToastActivationUri -Targets $targets -Context $activationContext -Terminal $terminal
             }
             catch {
                 $activationUri = ""
@@ -547,9 +550,17 @@ try {
             }
             if ($targets.Count -gt 0) {
                 $turnState.targets = $targets
+                $activationContext = Get-CodexToastActivationContext
+                if ($activationContext.Installed -and $activationContext.Current) {
+                    . (Join-Path $PSScriptRoot "terminal-providers.ps1")
+                    $terminal = Get-CodexToastTerminalContext -PrimaryTarget $targets[0]
+                    if ($null -ne $terminal) {
+                        $turnState.terminal = $terminal
+                    }
+                }
             }
 
-            $turnState | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
+            $turnState | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
             Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "prompt-saved"
             [Console]::Out.WriteLine('{"continue":true}')
             exit 0
@@ -581,7 +592,7 @@ try {
                 }
                 if ($activationContext.Installed -and $activationContext.Current -and $targets.Count -gt 0) {
                     try {
-                        $activationUri = New-CodexToastActivationUri -Targets $targets -Context $activationContext
+                        $activationUri = New-CodexToastActivationUri -Targets $targets -Context $activationContext -Terminal $turnState.terminal
                     }
                     catch {
                         $activationUri = ""

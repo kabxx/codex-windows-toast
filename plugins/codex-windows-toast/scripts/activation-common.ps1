@@ -1,12 +1,20 @@
 $script:CodexToastProtocol = "codex-windows-toast"
 $script:CodexToastOwner = "codex-windows-toast"
 $script:CodexToastActivationRecordSchemaVersion = 2
-$script:CodexToastActivationComponentVersion = 1
+$script:CodexToastActivationComponentVersion = 2
+$script:CodexToastActivationRequestVersion = 3
+$script:CodexToastActivationRecordMaxBytes = 32768
+$script:CodexToastActivationRecordLifetimeDays = 7
 $script:CodexToastActivationSourcePath = $PSScriptRoot
 $script:CodexToastActivationFileNames = @(
     "activate-window.ps1",
     "launch-hidden.vbs",
-    "activation-common.ps1"
+    "activation-common.ps1",
+    "terminal-providers.ps1",
+    "providers\wezterm.ps1",
+    "providers\windows-terminal.ps1",
+    "providers\windows-terminal-uia.ps1",
+    "providers\tmux.ps1"
 )
 
 function Get-CodexToastRuntimePath {
@@ -19,6 +27,12 @@ function Get-CodexToastHandlerPath {
 
 function Get-CodexToastLauncherPath {
     return Join-Path (Get-CodexToastRuntimePath) "launch-hidden.vbs"
+}
+
+function Get-CodexToastActivationRecordDirectory {
+    param([string]$RuntimePath = (Get-CodexToastRuntimePath))
+
+    return Join-Path $RuntimePath "activations"
 }
 
 function Get-CodexToastActivationComponent {
@@ -328,14 +342,277 @@ function ConvertFrom-CodexToastActivationTargets {
     return $targets
 }
 
+function Get-CodexToastActivationRecordPayload {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$RecordJson
+    )
+
+    if ($Id -notmatch "^[0-9a-f]{32}$") {
+        throw "Invalid activation record ID."
+    }
+
+    return "v=$script:CodexToastActivationRequestVersion&id=$Id`n$RecordJson"
+}
+
+function Test-CodexToastActivationRecordDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "Activation record directory is missing."
+    }
+
+    $directory = Get-Item -Force -LiteralPath $Path
+    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Activation record directory must not be a reparse point."
+    }
+}
+
+function Remove-CodexToastExpiredActivationRecords {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [DateTime]$NowUtc = [DateTime]::UtcNow
+    )
+
+    Test-CodexToastActivationRecordDirectory -Path $Directory
+    $recordCutoff = $NowUtc.AddDays(-$script:CodexToastActivationRecordLifetimeDays)
+    $temporaryCutoff = $NowUtc.AddHours(-1)
+    foreach ($entry in @(Get-ChildItem -Force -LiteralPath $Directory)) {
+        if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            continue
+        }
+
+        $remove = ($entry.Name -match "^[0-9a-f]{32}\.json$" -and $entry.LastWriteTimeUtc -lt $recordCutoff) -or
+            ($entry.Name -match "^[0-9a-f]{32}\.tmp$" -and $entry.LastWriteTimeUtc -lt $temporaryCutoff)
+        if ($remove) {
+            Remove-Item -Force -LiteralPath $entry.FullName -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function ConvertFrom-CodexToastActivationRecord {
+    param(
+        [Parameter(Mandatory)]$Record,
+        [DateTime]$NowUtc = [DateTime]::UtcNow
+    )
+
+    [long]$createdTicks = 0
+    [long]$expiresTicks = 0
+    if ([int]$Record.version -ne $script:CodexToastActivationRequestVersion -or
+        -not [long]::TryParse([string]$Record.created_utc_ticks, [ref]$createdTicks) -or
+        -not [long]::TryParse([string]$Record.expires_utc_ticks, [ref]$expiresTicks) -or
+        $createdTicks -le 0 -or $expiresTicks -le $createdTicks -or
+        ($expiresTicks - $createdTicks) -gt [TimeSpan]::FromDays($script:CodexToastActivationRecordLifetimeDays).Ticks) {
+        throw "Invalid activation record."
+    }
+
+    $createdUtc = [DateTime]::new($createdTicks, [DateTimeKind]::Utc)
+    $expiresUtc = [DateTime]::new($expiresTicks, [DateTimeKind]::Utc)
+    if ($createdUtc -gt $NowUtc.AddMinutes(5) -or $expiresUtc -lt $NowUtc) {
+        throw "Activation record has expired."
+    }
+
+    $targets = @(ConvertFrom-CodexToastActivationTargets -Value (
+        ConvertTo-CodexToastActivationTargets -Targets @($Record.targets)
+    ))
+
+    return [pscustomobject]@{
+        version = $script:CodexToastActivationRequestVersion
+        created_utc_ticks = $createdTicks
+        expires_utc_ticks = $expiresTicks
+        targets = $targets
+        terminal = $Record.terminal
+    }
+}
+
+function Read-CodexToastActivationRecord {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Signature,
+        [Parameter(Mandatory)]$Context,
+        [switch]$Consume,
+        [DateTime]$NowUtc = [DateTime]::UtcNow
+    )
+
+    if ($Id -notmatch "^[0-9a-f]{32}$" -or $Signature -notmatch "^[0-9a-f]{64}$") {
+        throw "Invalid activation record reference."
+    }
+
+    $directory = Get-CodexToastActivationRecordDirectory -RuntimePath $Context.RuntimePath
+    Test-CodexToastActivationRecordDirectory -Path $directory
+    $path = Join-Path $directory "$Id.json"
+    $recordItem = Get-Item -Force -LiteralPath $path -ErrorAction Stop
+    if ($recordItem.PSIsContainer -or
+        ($recordItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Invalid activation record file."
+    }
+
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Delete)
+        if ($stream.Length -le 0 -or $stream.Length -gt $script:CodexToastActivationRecordMaxBytes) {
+            throw "Invalid activation record size."
+        }
+
+        $recordBytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $recordBytes.Length) {
+            $read = $stream.Read($recordBytes, $offset, $recordBytes.Length - $offset)
+            if ($read -le 0) {
+                throw "Invalid activation record size."
+            }
+            $offset += $read
+        }
+        if ($recordBytes.Length -ge 3 -and
+            $recordBytes[0] -eq 0xEF -and $recordBytes[1] -eq 0xBB -and $recordBytes[2] -eq 0xBF) {
+            throw "Invalid activation record encoding."
+        }
+        $recordJson = (New-Object Text.UTF8Encoding($false, $true)).GetString($recordBytes)
+
+        $payload = Get-CodexToastActivationRecordPayload -Id $Id -RecordJson $recordJson
+        $secret = Get-CodexToastSecret -Path $Context.SecretPath
+        try {
+            $expectedSignature = Get-CodexToastHmacHex -Key $secret -Payload $payload
+        }
+        finally {
+            [Array]::Clear($secret, 0, $secret.Length)
+        }
+
+        if (-not (Test-CodexToastSignature -Expected $expectedSignature -Actual $Signature)) {
+            throw "Invalid activation signature."
+        }
+
+        $record = $null
+        $recordError = $null
+        try {
+            $record = ConvertFrom-CodexToastActivationRecord -Record ($recordJson | ConvertFrom-Json) -NowUtc $NowUtc
+        }
+        catch {
+            $recordError = $_
+        }
+
+        if ($Consume -or $null -ne $recordError) {
+            [IO.File]::Delete($path)
+        }
+        if ($null -ne $recordError) {
+            throw $recordError
+        }
+        return $record
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Enter-CodexToastActivationClaim {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Signature,
+        [Parameter(Mandatory)]$Context,
+        [DateTime]$NowUtc = [DateTime]::UtcNow
+    )
+
+    if ($Id -notmatch "^[0-9a-f]{32}$") {
+        throw "Invalid activation record ID."
+    }
+
+    $mutexName = "Local\CodexWindowsToast-Activation-$Id"
+    $createdNew = $false
+    $mutex = New-Object Threading.Mutex($false, $mutexName, [ref]$createdNew)
+    $ownsMutex = $false
+    try {
+        try {
+            $ownsMutex = $mutex.WaitOne(0)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $ownsMutex = $true
+        }
+
+        if (-not $ownsMutex) {
+            throw "Activation record is already being handled."
+        }
+
+        $record = Read-CodexToastActivationRecord `
+            -Id $Id `
+            -Signature $Signature `
+            -Context $Context `
+            -NowUtc $NowUtc
+        return [pscustomobject]@{
+            Record = $record
+            Mutex = $mutex
+        }
+    }
+    catch {
+        if ($ownsMutex) {
+            try { [void]$mutex.ReleaseMutex() } catch { }
+        }
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Complete-CodexToastActivationClaim {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)]$Claim
+    )
+
+    try {
+        $directory = Get-CodexToastActivationRecordDirectory -RuntimePath $Context.RuntimePath
+        Test-CodexToastActivationRecordDirectory -Path $directory
+        $path = Join-Path $directory "$Id.json"
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [IO.File]::Delete($path)
+        }
+    }
+    finally {
+        try { [void]$Claim.Mutex.ReleaseMutex() } catch { }
+        $Claim.Mutex.Dispose()
+    }
+}
+
+function Release-CodexToastActivationClaim {
+    param([Parameter(Mandatory)]$Claim)
+
+    try { [void]$Claim.Mutex.ReleaseMutex() } catch { }
+    $Claim.Mutex.Dispose()
+}
+
 function New-CodexToastActivationUri {
     param(
         [Parameter(Mandatory)][object[]]$Targets,
-        [Parameter(Mandatory)]$Context
+        [Parameter(Mandatory)]$Context,
+        [AllowNull()]$Terminal = $null,
+        [DateTime]$NowUtc = [DateTime]::UtcNow
     )
 
-    $serializedTargets = ConvertTo-CodexToastActivationTargets -Targets $Targets
-    $payload = "v=2&targets=$serializedTargets"
+    $normalizedTargets = @(ConvertFrom-CodexToastActivationTargets -Value (
+        ConvertTo-CodexToastActivationTargets -Targets $Targets
+    ))
+    $record = [ordered]@{
+        version = $script:CodexToastActivationRequestVersion
+        created_utc_ticks = $NowUtc.Ticks
+        expires_utc_ticks = $NowUtc.AddDays($script:CodexToastActivationRecordLifetimeDays).Ticks
+        targets = $normalizedTargets
+        terminal = $Terminal
+    }
+    $recordJson = $record | ConvertTo-Json -Depth 12 -Compress
+    if ([Text.Encoding]::UTF8.GetByteCount($recordJson) -gt $script:CodexToastActivationRecordMaxBytes) {
+        throw "Activation record is too large."
+    }
+
+    $directory = Get-CodexToastActivationRecordDirectory -RuntimePath $Context.RuntimePath
+    if (-not (Test-Path -LiteralPath $directory)) {
+        [void][IO.Directory]::CreateDirectory($directory)
+    }
+    Test-CodexToastActivationRecordDirectory -Path $directory
+    Remove-CodexToastExpiredActivationRecords -Directory $directory -NowUtc $NowUtc
+
+    $id = [Guid]::NewGuid().ToString("N")
+    $payload = Get-CodexToastActivationRecordPayload -Id $id -RecordJson $recordJson
     $secret = Get-CodexToastSecret -Path $Context.SecretPath
     try {
         $signature = Get-CodexToastHmacHex -Key $secret -Payload $payload
@@ -344,13 +621,35 @@ function New-CodexToastActivationUri {
         [Array]::Clear($secret, 0, $secret.Length)
     }
 
-    return "${script:CodexToastProtocol}://activate?$payload&sig=$signature"
+    $temporaryPath = Join-Path $directory "$id.tmp"
+    $recordPath = Join-Path $directory "$id.json"
+    $stream = $null
+    try {
+        $recordBytes = (New-Object Text.UTF8Encoding($false)).GetBytes($recordJson)
+        $stream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Write($recordBytes, 0, $recordBytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        Move-Item -LiteralPath $temporaryPath -Destination $recordPath
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        Remove-Item -Force -LiteralPath $temporaryPath -ErrorAction SilentlyContinue
+    }
+
+    return "${script:CodexToastProtocol}://activate?v=$script:CodexToastActivationRequestVersion&id=$id&sig=$signature"
 }
 
 function Write-CodexToastActivationStatus {
     param(
         [Parameter(Mandatory)][string]$Result,
-        [AllowEmptyString()][string]$Detail = ""
+        [AllowEmptyString()][string]$Detail = "",
+        [AllowEmptyString()][string]$TerminalProvider = "",
+        [AllowEmptyString()][string]$TerminalResult = "",
+        [AllowEmptyString()][string]$ActivationId = ""
     )
 
     try {
@@ -358,6 +657,9 @@ function Write-CodexToastActivationStatus {
             timestamp = [DateTimeOffset]::Now.ToString("o")
             result = $Result
             detail = $Detail
+            terminal_provider = $TerminalProvider
+            terminal_result = $TerminalResult
+            activation_id = $ActivationId
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path (Get-CodexToastRuntimePath) "last-activation-status.json") -Encoding UTF8
     }
     catch {
