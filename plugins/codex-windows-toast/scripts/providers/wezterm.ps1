@@ -117,6 +117,98 @@ function Resolve-CodexToastWezTermCapturePaneId {
     return $EnvironmentPaneId
 }
 
+function Resolve-CodexToastWezTermOriginProcessId {
+    param(
+        [Parameter(Mandatory)][object[]]$Clients,
+        [Parameter(Mandatory)][string]$EnvironmentPaneId
+    )
+
+    $validClients = @($Clients | Where-Object {
+        [string]$_.pid -match "^[1-9][0-9]{0,9}$"
+    })
+    if ($validClients.Count -eq 1) {
+        return [long]$validClients[0].pid
+    }
+
+    $focusedClients = @($validClients | Where-Object {
+        [string]$_.focused_pane_id -ceq $EnvironmentPaneId
+    })
+    if ($focusedClients.Count -eq 1) {
+        return [long]$focusedClients[0].pid
+    }
+
+    return $null
+}
+
+function Get-CodexToastWezTermOriginProcessId {
+    param([DateTime]$DeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(1500))
+
+    if ([Environment]::GetEnvironmentVariable("TERM_PROGRAM", "Process") -ine "WezTerm") {
+        return $null
+    }
+
+    $paneId = [Environment]::GetEnvironmentVariable("WEZTERM_PANE", "Process")
+    $socketPath = [Environment]::GetEnvironmentVariable("WEZTERM_UNIX_SOCKET", "Process")
+    try {
+        $probe = ConvertFrom-CodexToastWezTermLocator -Value ([pscustomobject]@{
+            pane_id = $paneId
+            socket_path = $socketPath
+            mux_window_id = "0"
+        })
+    }
+    catch {
+        return $null
+    }
+
+    $guiProcesses = @(Get-Process -Name "wezterm-gui" -ErrorAction SilentlyContinue | Where-Object {
+        try {
+            -not [string]::IsNullOrWhiteSpace([string]$_.Path)
+        }
+        catch {
+            $false
+        }
+    })
+    $resolvedProcessIds = @()
+    foreach ($executablePath in @($guiProcesses | ForEach-Object {
+        Join-Path (Split-Path ([string]$_.Path) -Parent) "wezterm.exe"
+    } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+            continue
+        }
+
+        $timeout = Get-CodexToastTerminalTimeoutMilliseconds `
+            -DeadlineUtc $DeadlineUtc `
+            -MaximumMilliseconds $script:CodexToastWezTermCaptureTimeoutMilliseconds
+        if ($timeout -le 0) {
+            break
+        }
+        $clients = @(Invoke-CodexToastWezTermListClients `
+            -Executable $executablePath `
+            -SocketPath $probe.socket_path `
+            -TimeoutMilliseconds $timeout)
+        $processId = Resolve-CodexToastWezTermOriginProcessId `
+            -Clients $clients `
+            -EnvironmentPaneId $probe.pane_id
+        if ($null -eq $processId) {
+            continue
+        }
+
+        $matchingProcesses = @($guiProcesses | Where-Object {
+            [long]$_.Id -eq [long]$processId -and
+            (Join-Path (Split-Path ([string]$_.Path) -Parent) "wezterm.exe") -ieq $executablePath
+        })
+        if ($matchingProcesses.Count -eq 1) {
+            $resolvedProcessIds += [long]$processId
+        }
+    }
+
+    $resolvedProcessIds = @($resolvedProcessIds | Select-Object -Unique)
+    if ($resolvedProcessIds.Count -eq 1) {
+        return [long]$resolvedProcessIds[0]
+    }
+    return $null
+}
+
 function Test-CodexToastWezTermActivationState {
     param(
         [Parameter(Mandatory)][object[]]$Clients,

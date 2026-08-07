@@ -11,6 +11,7 @@ if (-not ("CodexWindowsToast.WindowCapture" -as [type])) {
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace CodexWindowsToast {
     public static class WindowCapture {
@@ -64,6 +65,9 @@ namespace CodexWindowsToast {
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetWindowRect(IntPtr hWnd, out Rect bounds);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maximumCount);
 
         [DllImport("dwmapi.dll")]
         private static extern int DwmGetWindowAttribute(IntPtr hWnd, uint attribute, out Rect value, int size);
@@ -225,6 +229,27 @@ namespace CodexWindowsToast {
 
             return selected.Count == 0 ? new IntPtr[] { target } : selected.ToArray();
         }
+
+        public static IntPtr[] GetProcessWindows(uint processId, string expectedClassName) {
+            if (processId == 0) {
+                return new IntPtr[0];
+            }
+
+            List<IntPtr> windows = new List<IntPtr>();
+            EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                uint candidateProcessId;
+                GetWindowThreadProcessId(hWnd, out candidateProcessId);
+                StringBuilder className = new StringBuilder(256);
+                GetClassName(hWnd, className, className.Capacity);
+                if (candidateProcessId == processId && IsWindowVisible(hWnd) && !IsCloaked(hWnd) &&
+                    (String.IsNullOrEmpty(expectedClassName) ||
+                        String.Equals(className.ToString(), expectedClassName, StringComparison.Ordinal))) {
+                    windows.Add(hWnd);
+                }
+                return true;
+            }, IntPtr.Zero);
+            return windows.ToArray();
+        }
     }
 }
 "@
@@ -367,15 +392,107 @@ function Get-PluginDataPath {
     return $pluginData
 }
 
-function Get-SessionStatePath {
-    param([string]$SessionId)
+function ConvertTo-HookStatePathComponent {
+    param(
+        [AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$Fallback
+    )
 
-    $safeSessionId = [regex]::Replace($SessionId, "[^A-Za-z0-9._-]", "_")
-    if ([string]::IsNullOrWhiteSpace($safeSessionId)) {
-        $safeSessionId = "unknown-session"
+    $safeValue = [regex]::Replace($Value, "[^A-Za-z0-9._-]", "_")
+    if ([string]::IsNullOrWhiteSpace($safeValue)) {
+        return $Fallback
     }
 
-    return Join-Path (Get-PluginDataPath) "turn-$safeSessionId.json"
+    return $safeValue
+}
+
+function Get-TurnStatePath {
+    param(
+        [string]$SessionId,
+        [string]$TurnId
+    )
+
+    $safeSessionId = ConvertTo-HookStatePathComponent -Value $SessionId -Fallback "unknown-session"
+    $safeTurnId = ConvertTo-HookStatePathComponent -Value $TurnId -Fallback "unknown-turn"
+    return Join-Path (Get-PluginDataPath) "turn-$safeSessionId-$safeTurnId.json"
+}
+
+function Get-SubagentStatePath {
+    param(
+        [string]$SessionId,
+        [string]$AgentId
+    )
+
+    $safeSessionId = ConvertTo-HookStatePathComponent -Value $SessionId -Fallback "unknown-session"
+    $safeAgentId = ConvertTo-HookStatePathComponent -Value $AgentId -Fallback "unknown-agent"
+    return Join-Path (Get-PluginDataPath) "subagent-$safeSessionId-$safeAgentId.json"
+}
+
+function Get-SessionHookStatePaths {
+    param(
+        [string]$SessionId,
+        [Parameter(Mandatory)][ValidateSet("turn", "subagent")][string]$Kind
+    )
+
+    $pluginData = Get-PluginDataPath
+    if (-not (Test-Path -LiteralPath $pluginData -PathType Container)) {
+        return
+    }
+
+    $safeSessionId = ConvertTo-HookStatePathComponent -Value $SessionId -Fallback "unknown-session"
+    Get-ChildItem -LiteralPath $pluginData -File -Filter "$Kind-$safeSessionId-*.json" -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName }
+}
+
+function Clear-SessionHookState {
+    param([string]$SessionId)
+
+    foreach ($kind in @("turn", "subagent")) {
+        foreach ($path in @(Get-SessionHookStatePaths -SessionId $SessionId -Kind $kind)) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                Remove-Item -LiteralPath $path -Force
+            }
+        }
+    }
+}
+
+function Test-SessionHasActiveSubagent {
+    param([string]$SessionId)
+
+    foreach ($path in @(Get-SessionHookStatePaths -SessionId $SessionId -Kind "subagent")) {
+        try {
+            $subagentState = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+            $parentTurnId = [string]$subagentState.parent_turn_id
+            if (-not [string]::IsNullOrWhiteSpace($parentTurnId) -and
+                (Test-Path -LiteralPath (Get-TurnStatePath -SessionId $SessionId -TurnId $parentTurnId) -PathType Leaf)) {
+                return $true
+            }
+        }
+        catch {
+            # Invalid lifecycle state is ignored and later cleared by session hooks.
+        }
+    }
+
+    return $false
+}
+
+function Remove-TurnSubagentState {
+    param(
+        [string]$SessionId,
+        [string]$TurnId
+    )
+
+    foreach ($path in @(Get-SessionHookStatePaths -SessionId $SessionId -Kind "subagent")) {
+        try {
+            $subagentState = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+            if ([string]$subagentState.parent_turn_id -ceq $TurnId) {
+                Remove-Item -LiteralPath $path -Force
+            }
+        }
+        catch {
+            # Preserve unknown files for the next bounded session cleanup.
+        }
+    }
 }
 
 function Get-WindowTarget {
@@ -413,6 +530,36 @@ function Get-ForegroundWindowTargets {
         }
 
         $windows = [CodexWindowsToast.WindowCapture]::GetSnapGroupWindows($window, 8)
+        for ($index = 0; $index -lt $windows.Count; $index++) {
+            $target = Get-WindowTarget -Window $windows[$index]
+            if ($null -eq $target) {
+                if ($index -eq 0) {
+                    return
+                }
+                continue
+            }
+
+            Write-Output $target
+        }
+    }
+    catch {
+        return
+    }
+}
+
+function Get-ProcessWindowTargets {
+    param(
+        [Parameter(Mandatory)][uint32]$ProcessId,
+        [AllowEmptyString()][string]$ExpectedClassName = ""
+    )
+
+    try {
+        $processWindows = @([CodexWindowsToast.WindowCapture]::GetProcessWindows($ProcessId, $ExpectedClassName))
+        if ($processWindows.Count -ne 1) {
+            return
+        }
+
+        $windows = [CodexWindowsToast.WindowCapture]::GetSnapGroupWindows($processWindows[0], 8)
         for ($index = 0; $index -lt $windows.Count; $index++) {
             $target = Get-WindowTarget -Window $windows[$index]
             if ($null -eq $target) {
@@ -540,28 +687,121 @@ try {
         $sessionId = [string]$hookInput.session_id
         $turnId = [string]$hookInput.turn_id
 
+        if ($eventName -eq "SessionStart") {
+            $source = [string]$hookInput.source
+            if ($source -in @("startup", "resume", "clear")) {
+                Clear-SessionHookState -SessionId $sessionId
+                $result = "session-state-cleared"
+            }
+            else {
+                $result = "session-state-preserved"
+            }
+            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result $result
+            [Console]::Out.WriteLine('{"continue":true}')
+            exit 0
+        }
+
+        if ($eventName -eq "SessionEnd") {
+            Clear-SessionHookState -SessionId $sessionId
+            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "session-state-cleared"
+            [Console]::Out.WriteLine('{"continue":true}')
+            exit 0
+        }
+
+        if ($eventName -eq "SubagentStart") {
+            $agentId = [string]$hookInput.agent_id
+            if ([string]::IsNullOrWhiteSpace($agentId)) {
+                throw "SubagentStart did not include an agent ID."
+            }
+
+            $pluginData = Get-PluginDataPath
+            New-Item -ItemType Directory -Path $pluginData -Force | Out-Null
+            [ordered]@{
+                parent_turn_id = $turnId
+                agent_id = $agentId
+            } | ConvertTo-Json | Set-Content `
+                -LiteralPath (Get-SubagentStatePath -SessionId $sessionId -AgentId $agentId) `
+                -Encoding UTF8
+            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "subagent-tracked"
+            [Console]::Out.WriteLine('{"continue":true}')
+            exit 0
+        }
+
+        if ($eventName -eq "SubagentStop") {
+            $agentId = [string]$hookInput.agent_id
+            if (-not [string]::IsNullOrWhiteSpace($agentId)) {
+                $subagentStatePath = Get-SubagentStatePath -SessionId $sessionId -AgentId $agentId
+                if (Test-Path -LiteralPath $subagentStatePath -PathType Leaf) {
+                    Remove-Item -LiteralPath $subagentStatePath -Force
+                }
+            }
+            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "subagent-untracked"
+            [Console]::Out.WriteLine('{"continue":true}')
+            exit 0
+        }
+
         if ($eventName -eq "UserPromptSubmit") {
             $pluginData = Get-PluginDataPath
             New-Item -ItemType Directory -Path $pluginData -Force | Out-Null
-            $targets = @(Get-ForegroundWindowTargets)
+            $isSubagent = Test-SessionHasActiveSubagent -SessionId $sessionId
             $turnState = [ordered]@{
                 turn_id = $turnId
                 title = ConvertTo-ToastText -Text ([string]$hookInput.prompt) -MaxLength 120
+                suppress_notification = $isSubagent
             }
-            if ($targets.Count -gt 0) {
-                $turnState.targets = $targets
+            if (-not $isSubagent) {
                 $activationContext = Get-CodexToastActivationContext
+                $terminalProvidersLoaded = $false
+                $originProcessId = $null
                 if ($activationContext.Installed -and $activationContext.Current) {
                     . (Join-Path $PSScriptRoot "terminal-providers.ps1")
-                    $terminal = Get-CodexToastTerminalContext -PrimaryTarget $targets[0]
+                    $terminalProvidersLoaded = $true
+                    $originProcessId = Get-CodexToastTerminalOriginProcessId
+                }
+
+                $targets = @(
+                    if ($null -ne $originProcessId) {
+                        $expectedClassName = if (
+                            [Environment]::GetEnvironmentVariable("TERM_PROGRAM", "Process") -ieq "WezTerm"
+                        ) { "org.wezfurlong.wezterm" } else { "" }
+                        Get-ProcessWindowTargets `
+                            -ProcessId ([uint32]$originProcessId) `
+                            -ExpectedClassName $expectedClassName
+                    }
+                    else {
+                        Get-ForegroundWindowTargets
+                    }
+                )
+                $terminal = $null
+                if ($targets.Count -gt 0) {
+                    if ($activationContext.Installed -and $activationContext.Current) {
+                        if (-not $terminalProvidersLoaded) {
+                            . (Join-Path $PSScriptRoot "terminal-providers.ps1")
+                        }
+                        $terminal = Get-CodexToastTerminalContext -PrimaryTarget $targets[0]
+                    }
+
+                    $isWezTermOrigin =
+                        [Environment]::GetEnvironmentVariable("TERM_PROGRAM", "Process") -ieq "WezTerm" -and
+                        -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("WEZTERM_PANE", "Process"))
+                    if ($isWezTermOrigin -and $null -eq $terminal) {
+                        $targets = @()
+                    }
+                }
+
+                if ($targets.Count -gt 0) {
+                    $turnState.targets = $targets
                     if ($null -ne $terminal) {
                         $turnState.terminal = $terminal
                     }
                 }
             }
 
-            $turnState | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Get-SessionStatePath -SessionId $sessionId) -Encoding UTF8
-            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "prompt-saved"
+            $turnState | ConvertTo-Json -Depth 12 | Set-Content `
+                -LiteralPath (Get-TurnStatePath -SessionId $sessionId -TurnId $turnId) `
+                -Encoding UTF8
+            $result = if ($isSubagent) { "subagent-prompt-saved" } else { "prompt-saved" }
+            Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result $result
             [Console]::Out.WriteLine('{"continue":true}')
             exit 0
         }
@@ -573,10 +813,17 @@ try {
 
         $title = ""
         $activationUri = ""
-        $statePath = Get-SessionStatePath -SessionId $sessionId
+        $statePath = Get-TurnStatePath -SessionId $sessionId -TurnId $turnId
         if (Test-Path -LiteralPath $statePath) {
             $turnState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
             if ([string]$turnState.turn_id -eq $turnId -and -not [string]::IsNullOrWhiteSpace([string]$turnState.title)) {
+                if ([bool]$turnState.suppress_notification) {
+                    Remove-Item -LiteralPath $statePath -Force
+                    Write-HookStatus -EventName $eventName -SessionId $sessionId -TurnId $turnId -Result "skipped-subagent"
+                    [Console]::Out.WriteLine('{"continue":true}')
+                    exit 0
+                }
+
                 $title = [string]$turnState.title
 
                 $activationContext = Get-CodexToastActivationContext
@@ -620,6 +867,7 @@ try {
         if (Test-Path -LiteralPath $statePath -PathType Leaf) {
             Remove-Item -LiteralPath $statePath -Force
         }
+        Remove-TurnSubagentState -SessionId $sessionId -TurnId $turnId
     }
 }
 catch {

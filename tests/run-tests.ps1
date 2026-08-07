@@ -13,6 +13,7 @@ $launcherPath = Join-Path $scriptRoot "launch-hidden.vbs"
 $terminalProvidersPath = Join-Path $scriptRoot "terminal-providers.ps1"
 $windowsTerminalUiaPath = Join-Path $scriptRoot "providers\windows-terminal-uia.ps1"
 $setupPath = Join-Path $scriptRoot "setup.ps1"
+$hooksPath = Join-Path $repoRoot "plugins\codex-windows-toast\hooks\hooks.json"
 
 function Assert-Equal {
     param(
@@ -41,7 +42,7 @@ function Assert-Throws {
     throw "$Name failed. The operation did not throw."
 }
 
-function Invoke-HookScript {
+function Start-HookScript {
     param(
         [Parameter(Mandatory)][string]$Json,
         [Parameter(Mandatory)][string]$PluginData
@@ -64,6 +65,19 @@ function Invoke-HookScript {
         [void]$process.Start()
         $process.StandardInput.WriteLine($Json)
         $process.StandardInput.Close()
+        return [pscustomobject]@{ Process = $process }
+    }
+    catch {
+        $process.Dispose()
+        throw
+    }
+}
+
+function Receive-HookScript {
+    param([Parameter(Mandatory)]$Invocation)
+
+    $process = $Invocation.Process
+    try {
         $output = $process.StandardOutput.ReadToEnd().Trim()
         $errorOutput = $process.StandardError.ReadToEnd().Trim()
         $process.WaitForExit()
@@ -76,6 +90,15 @@ function Invoke-HookScript {
     finally {
         $process.Dispose()
     }
+}
+
+function Invoke-HookScript {
+    param(
+        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][string]$PluginData
+    )
+
+    return Receive-HookScript -Invocation (Start-HookScript -Json $Json -PluginData $PluginData)
 }
 
 $tokens = $null
@@ -98,6 +121,18 @@ if ($null -eq $textFunction) {
     throw "ConvertTo-ToastText was not found."
 }
 Invoke-Expression $textFunction.Extent.Text
+
+$hookConfiguration = Get-Content -Raw -LiteralPath $hooksPath | ConvertFrom-Json
+foreach ($eventName in @("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "SessionEnd")) {
+    Assert-Equal `
+        -Expected $true `
+        -Actual ([bool]($hookConfiguration.hooks.PSObject.Properties.Name -ccontains $eventName)) `
+        -Name "$eventName hook registration"
+}
+Assert-Equal `
+    -Expected "startup|resume|clear" `
+    -Actual ([string]$hookConfiguration.hooks.SessionStart[0].matcher) `
+    -Name "SessionStart excludes compact lifecycle events"
 
 $emoji = [char]::ConvertFromUtf32(0x1F642)
 $emojiInput = ("a" * 236) + $emoji + "tail"
@@ -308,6 +343,25 @@ Assert-Equal `
     -Expected "16" `
     -Actual (Resolve-CodexToastWezTermCapturePaneId -EnvironmentPaneId "18" -FocusedPaneId "16" -TmuxAttached $true) `
     -Name "WezTerm capture uses focused client for tmux"
+$uniqueWezTermClient = @([pscustomobject]@{ pid = 27564; focused_pane_id = 16 })
+Assert-Equal `
+    -Expected 27564 `
+    -Actual (Resolve-CodexToastWezTermOriginProcessId -Clients $uniqueWezTermClient -EnvironmentPaneId "18") `
+    -Name "WezTerm origin resolves a unique GUI client"
+$multipleWezTermClients = @(
+    [pscustomobject]@{ pid = 27564; focused_pane_id = 16 },
+    [pscustomobject]@{ pid = 38116; focused_pane_id = 18 }
+)
+Assert-Equal `
+    -Expected 38116 `
+    -Actual (Resolve-CodexToastWezTermOriginProcessId -Clients $multipleWezTermClients -EnvironmentPaneId "18") `
+    -Name "WezTerm origin resolves the client focused on the environment pane"
+Assert-Equal `
+    -Expected $true `
+    -Actual ($null -eq (Resolve-CodexToastWezTermOriginProcessId `
+        -Clients $multipleWezTermClients `
+        -EnvironmentPaneId "19")) `
+    -Name "WezTerm origin rejects ambiguous clients"
 $wezTermClients = @([pscustomobject]@{ pid = 27564; focused_pane_id = 18 })
 $wezTermPanes = @([pscustomobject]@{ pane_id = 18; window_id = 2 })
 Assert-Equal `
@@ -444,6 +498,11 @@ Assert-Equal `
 
 $setupTokens = $null
 $setupParseErrors = $null
+$setupText = Get-Content -Raw -LiteralPath $setupPath
+Assert-Equal `
+    -Expected $true `
+    -Actual ([bool]($setupText -cmatch 'subagent-\*\.json')) `
+    -Name "setup removes subagent lifecycle state"
 $setupAst = [Management.Automation.Language.Parser]::ParseFile(
     $setupPath,
     [ref]$setupTokens,
@@ -536,8 +595,12 @@ if ($Integration) {
     $testData = Join-Path ([IO.Path]::GetTempPath()) "codex-windows-toast-$([Guid]::NewGuid().ToString('N'))"
     [void][IO.Directory]::CreateDirectory($testData)
     $sessionId = "unicode-integration"
-    $statePath = Join-Path $testData "turn-$sessionId.json"
-    $mismatchStatePath = Join-Path $testData "turn-mismatch-integration.json"
+    $turnId = "turn-1"
+    $statePath = Join-Path $testData "turn-$sessionId-$turnId.json"
+    $mismatchStatePath = Join-Path $testData "turn-mismatch-integration-turn-1.json"
+    $subagentStatePath = Join-Path $testData "subagent-$sessionId-agent-1.json"
+    $childStatePath1 = Join-Path $testData "turn-$sessionId-child-turn-1.json"
+    $childStatePath2 = Join-Path $testData "turn-$sessionId-child-turn-2.json"
     $statusPath = Join-Path $testData "last-hook-status.json"
     try {
         $noStateJson = [ordered]@{
@@ -570,9 +633,24 @@ if ($Integration) {
         Assert-Equal -Expected 0 -Actual $mismatchStopResult.ExitCode -Name "mismatch Stop exit code"
         $mismatchStatus = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
         Assert-Equal -Expected "skipped-no-prompt" -Actual ([string]$mismatchStatus.result) -Name "mismatch Stop status"
-        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $mismatchStatePath) -Name "mismatch state cleanup"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $mismatchStatePath) -Name "mismatch preserves other turn state"
+        $compactSessionStartJson = [ordered]@{
+            hook_event_name = "SessionStart"
+            session_id = "mismatch-integration"
+            source = "compact"
+        } | ConvertTo-Json -Compress
+        $compactSessionStartResult = Invoke-HookScript -Json $compactSessionStartJson -PluginData $testData
+        Assert-Equal -Expected 0 -Actual $compactSessionStartResult.ExitCode -Name "compact SessionStart exit code"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $mismatchStatePath) -Name "compact preserves turn state"
+        $mismatchSessionEndJson = [ordered]@{
+            hook_event_name = "SessionEnd"
+            session_id = "mismatch-integration"
+            reason = "test-complete"
+        } | ConvertTo-Json -Compress
+        $mismatchSessionEndResult = Invoke-HookScript -Json $mismatchSessionEndJson -PluginData $testData
+        Assert-Equal -Expected 0 -Actual $mismatchSessionEndResult.ExitCode -Name "mismatch SessionEnd exit code"
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $mismatchStatePath) -Name "SessionEnd state cleanup"
 
-        $turnId = "turn-1"
         $promptJson = [ordered]@{
             hook_event_name = "UserPromptSubmit"
             session_id = $sessionId
@@ -584,6 +662,98 @@ if ($Integration) {
         Assert-Equal -Expected '{"continue":true}' -Actual $promptResult.Output -Name "prompt hook output"
         $promptStatus = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
         Assert-Equal -Expected "prompt-saved" -Actual ([string]$promptStatus.result) -Name "prompt hook status"
+        $mainTurnState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+        Assert-Equal -Expected $false -Actual ([bool]$mainTurnState.suppress_notification) -Name "main prompt notification"
+        $installedActivationContext = Get-CodexToastActivationContext
+        if ($installedActivationContext.Installed -and $installedActivationContext.Current -and
+            [Environment]::GetEnvironmentVariable("TERM_PROGRAM", "Process") -ieq "WezTerm") {
+            $originProcessId = Get-CodexToastTerminalOriginProcessId
+            Assert-Equal `
+                -Expected $originProcessId `
+                -Actual ([long]$mainTurnState.targets[0].pid) `
+                -Name "main prompt uses WezTerm origin process"
+            Assert-Equal `
+                -Expected ([Environment]::GetEnvironmentVariable("WEZTERM_PANE", "Process")) `
+                -Actual ([string]$mainTurnState.terminal.outer.locator.pane_id) `
+                -Name "main prompt uses WezTerm environment pane"
+        }
+
+        $subagentStartJson = [ordered]@{
+            hook_event_name = "SubagentStart"
+            session_id = $sessionId
+            turn_id = $turnId
+            agent_id = "agent-1"
+            agent_type = "default"
+        } | ConvertTo-Json -Compress
+        $subagentStartResult = Invoke-HookScript -Json $subagentStartJson -PluginData $testData
+        Assert-Equal -Expected 0 -Actual $subagentStartResult.ExitCode -Name "SubagentStart exit code"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $subagentStatePath) -Name "SubagentStart lifecycle state"
+
+        $childPromptInvocations = @()
+        foreach ($childTurnId in @("child-turn-1", "child-turn-2")) {
+            $childPromptJson = [ordered]@{
+                hook_event_name = "UserPromptSubmit"
+                session_id = $sessionId
+                turn_id = $childTurnId
+                prompt = "Spawned branch $childTurnId"
+            } | ConvertTo-Json -Compress
+            $childPromptInvocations += [pscustomobject]@{
+                TurnId = $childTurnId
+                Invocation = Start-HookScript -Json $childPromptJson -PluginData $testData
+            }
+        }
+        foreach ($childPromptInvocation in $childPromptInvocations) {
+            $childPromptResult = Receive-HookScript -Invocation $childPromptInvocation.Invocation
+            Assert-Equal `
+                -Expected 0 `
+                -Actual $childPromptResult.ExitCode `
+                -Name "$($childPromptInvocation.TurnId) prompt exit code"
+        }
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $childStatePath1) -Name "first concurrent turn state"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $childStatePath2) -Name "second concurrent turn state"
+        $childState1 = Get-Content -Raw -LiteralPath $childStatePath1 | ConvertFrom-Json
+        $childState2 = Get-Content -Raw -LiteralPath $childStatePath2 | ConvertFrom-Json
+        Assert-Equal -Expected $true -Actual ([bool]$childState1.suppress_notification) -Name "first subagent prompt suppression"
+        Assert-Equal -Expected $true -Actual ([bool]$childState2.suppress_notification) -Name "second subagent prompt suppression"
+
+        $childStopJson1 = [ordered]@{
+            hook_event_name = "Stop"
+            session_id = $sessionId
+            turn_id = "child-turn-1"
+            last_assistant_message = "First branch finished"
+        } | ConvertTo-Json -Compress
+        $childStopResult1 = Invoke-HookScript -Json $childStopJson1 -PluginData $testData
+        Assert-Equal -Expected 0 -Actual $childStopResult1.ExitCode -Name "first subagent Stop exit code"
+        $childStopStatus1 = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
+        Assert-Equal -Expected "skipped-subagent" -Actual ([string]$childStopStatus1.result) -Name "first subagent Stop status"
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $childStatePath1) -Name "first subagent state cleanup"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $childStatePath2) -Name "first Stop preserves concurrent turn"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $statePath) -Name "first Stop preserves main turn"
+
+        $childStopJson2 = [ordered]@{
+            hook_event_name = "Stop"
+            session_id = $sessionId
+            turn_id = "child-turn-2"
+            last_assistant_message = "Second branch finished"
+        } | ConvertTo-Json -Compress
+        $childStopResult2 = Invoke-HookScript -Json $childStopJson2 -PluginData $testData
+        Assert-Equal -Expected 0 -Actual $childStopResult2.ExitCode -Name "second subagent Stop exit code"
+        $childStopStatus2 = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
+        Assert-Equal -Expected "skipped-subagent" -Actual ([string]$childStopStatus2.result) -Name "second subagent Stop status"
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $childStatePath2) -Name "second subagent state cleanup"
+        Assert-Equal -Expected $true -Actual (Test-Path -LiteralPath $statePath) -Name "second Stop preserves main turn"
+
+        $subagentStopJson = [ordered]@{
+            hook_event_name = "SubagentStop"
+            session_id = $sessionId
+            turn_id = $turnId
+            agent_id = "agent-1"
+            agent_type = "default"
+            last_assistant_message = "Branches complete"
+        } | ConvertTo-Json -Compress
+        $subagentStopResult = Invoke-HookScript -Json $subagentStopJson -PluginData $testData
+        Assert-Equal -Expected 0 -Actual $subagentStopResult.ExitCode -Name "SubagentStop exit code"
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $subagentStatePath) -Name "SubagentStop lifecycle cleanup"
 
         $message = ("a" * 236) + $emoji + [string][char]0x1 + "tail"
         $stopJson = [ordered]@{
@@ -603,7 +773,14 @@ if ($Integration) {
         Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $statePath) -Name "turn state cleanup"
     }
     finally {
-        foreach ($path in @($statePath, $mismatchStatePath, $statusPath)) {
+        foreach ($path in @(
+            $statePath,
+            $mismatchStatePath,
+            $subagentStatePath,
+            $childStatePath1,
+            $childStatePath2,
+            $statusPath
+        )) {
             if (Test-Path -LiteralPath $path -PathType Leaf) {
                 Remove-Item -LiteralPath $path -Force
             }

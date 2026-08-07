@@ -153,20 +153,42 @@ function Get-CodexToastTerminalProviders {
             Layer = "outer"
             Capture = "Get-CodexToastWezTermCapture"
             Activate = "Invoke-CodexToastWezTermActivation"
+            ResolveProcessId = "Get-CodexToastWezTermOriginProcessId"
         }
         [pscustomobject]@{
             Id = "windows-terminal"
             Layer = "outer"
             Capture = "Get-CodexToastWindowsTerminalCapture"
             Activate = "Invoke-CodexToastWindowsTerminalActivation"
+            ResolveProcessId = ""
         }
         [pscustomobject]@{
             Id = "tmux"
             Layer = "inner"
             Capture = "Get-CodexToastTmuxCapture"
             Activate = "Invoke-CodexToastTmuxActivation"
+            ResolveProcessId = ""
         }
     )
+}
+
+function Get-CodexToastTerminalOriginProcessId {
+    $deadlineUtc = [DateTime]::UtcNow.AddMilliseconds($script:CodexToastTerminalCaptureBudgetMilliseconds)
+    foreach ($provider in @(Get-CodexToastTerminalProviders | Where-Object {
+        $_.Layer -ceq "outer" -and -not [string]::IsNullOrWhiteSpace([string]$_.ResolveProcessId)
+    })) {
+        try {
+            $resolved = @(& ([string]$provider.ResolveProcessId) -DeadlineUtc $deadlineUtc)
+            if ($resolved.Count -eq 1 -and [long]$resolved[0] -gt 0) {
+                return [long]$resolved[0]
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $null
 }
 
 function Get-CodexToastTerminalContext {

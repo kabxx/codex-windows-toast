@@ -534,7 +534,9 @@ function Remove-PluginState {
             }
 
             foreach ($file in @(Get-ChildItem -LiteralPath $directory.FullName -File)) {
-                if ($file.Name -eq "last-hook-status.json" -or $file.Name -like "turn-*.json") {
+                if ($file.Name -eq "last-hook-status.json" -or
+                    $file.Name -like "turn-*.json" -or
+                    $file.Name -like "subagent-*.json") {
                     if ($PSCmdlet.ShouldProcess($file.FullName, "Remove plugin state file")) {
                         Remove-Item -LiteralPath $file.FullName -Force
                     }

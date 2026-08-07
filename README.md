@@ -7,15 +7,20 @@ Windows toast whenever the main agent finishes a user-submitted turn and
 returns control to the user. The toast title is the current user prompt, and
 its body is the final assistant message for that turn. Stops without a matching
 user submission, such as automatic background continuations, are ignored.
-Notifications use Windows' `long` duration
-and can include two actions. Their labels follow the current Windows display
+Codex subagents reuse their parent's session ID, so the plugin tracks subagent
+lifecycle events and stores prompt state by both session and turn. Subagent
+completion notifications are suppressed and cannot overwrite the main turn's
+prompt or activation target. Notifications use Windows' `long` duration and
+can include two actions. Their labels follow the current Windows display
 language, with concise English labels as the fallback:
 
-- **Return** restores and activates the top-level window that was in front when
-  the prompt was submitted, then restores the originating terminal target when
-  an exact built-in provider is available. On Windows 11, if that window belongs
-  to a Snap Group, the plugin also attempts to restore and bring forward all
-  currently visible members of that group before focusing the original window.
+- **Return** restores and activates the prompt's captured top-level window, then
+  restores the originating terminal target when an exact built-in provider is
+  available. WezTerm resolves that window from its inherited socket; other
+  environments use the window in front when the prompt is submitted. On Windows
+  11, if that window belongs to a Snap Group, the plugin also attempts to restore
+  and bring forward all currently visible members before focusing the original
+  window.
 - **Dismiss** dismisses the notification.
 
 It does not notify for mid-turn approval requests. Disabling the plugin disables
@@ -51,9 +56,13 @@ codex plugin marketplace add .
 codex plugin add codex-windows-toast@codex-windows-toast
 ```
 
+After updating an existing local checkout, run the `codex plugin add` command
+again to refresh Codex's cached plugin copy. Then start a new Codex session and
+review the lifecycle hooks added by the updated version.
+
 Start a new Codex CLI session, run `/hooks`, then review and trust the plugin's
-`UserPromptSubmit` and `Stop` hooks. Codex requires this review before local or
-third-party hooks can run.
+prompt, stop, session lifecycle, and subagent lifecycle hooks. Codex requires
+this review before local or third-party hooks can run.
 
 ## Avoid Duplicate Notifications
 
@@ -120,9 +129,11 @@ Updates that change activation behavior require a fresh `setup.ps1 -Install`;
 After restoring the validated top-level window, the activation handler supports
 these built-in targets without companion plugins:
 
-- **WezTerm:** restores the exact captured pane and its tab through WezTerm's
-  own socket and CLI. A closed pane, restarted mux, or mismatched window falls
-  back to the outer window.
+- **WezTerm:** resolves the originating GUI process from the inherited socket
+  before window capture, then restores the exact captured pane and its tab
+  through WezTerm's own CLI. Switching panels immediately after submission does
+  not change the captured source. A closed pane, restarted mux, or ambiguous
+  window disables exact panel return rather than selecting another panel.
 - **Windows Terminal:** selects the exact captured live UI Automation tab and,
   when it remains identifiable, its pane. It never guesses by title or tab
   index and never invokes `wt.exe` to create or find a window.
